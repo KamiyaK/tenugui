@@ -24,7 +24,8 @@ _FIELD_KEYS = {"src", "out", "drop_src", "required", "sub", "synonyms", "on_unkn
                "trim"}
 _DERIVE_KEYS = {"out", "expr", "vars", "unit", "to", "unit_out", "decimals", "trim", "after"}
 _PART_KEYS = (_FIELD_KEYS - {"src", "extract", "drop_src"}) | {"unit_group"}
-_TOP_KEYS = {"schema_version", "settings", "units", "unit_alias", "synonyms", "field", "derive"}
+_TOP_KEYS = {"schema_version", "settings", "units", "unit_alias", "synonyms", "field", "derive", "test"}
+_TEST_KEYS = {"name", "in", "out", "codes"}
 
 
 # ---- 組み込みの分割パターン（NFKC正規化後の文字列に対して使う）
@@ -49,6 +50,88 @@ PRESETS: dict[str, tuple[str, dict[str, list[str]]]] = {
         rf"^(?P<lo>{_NUM})\s*(?P<u1>{_U})?\s*[~〜]\s*(?P<hi>{_NUM})\s*(?P<u2>{_U})?$",
         {"lo": ["u1", "u2"], "hi": ["u2", "u1"]}),
 }
+
+
+def shape_of(text: str) -> str:
+    """値の「形」。数値を # に置き換えたもの（330±15mm → #±#mm）。ばらつきの把握と pattern の元になる。"""
+    t = re.sub(r"\s+", " ", normalize_text(text))
+    t = re.sub(r"(?<=\d),(?=\d{3}(?!\d))", "", t)
+    return re.sub(r"\d+(?:\.\d+)?", "#", t)
+
+
+_PAT_UNIT = re.compile(r"[^\s±+\-/()~〜\d.,\[\]#{}]+")
+
+
+def compile_pattern(pattern: str) -> tuple[str, dict[str, list[str]]]:
+    """簡易記法を正規表現へ。戻り値 (正規表現, {数値名: 単位グループの候補順})。
+
+      #        数値（左から n1, n2, ... と名前が付く）
+      {name}   名前付きの数値
+      [ ... ]  省略可能な部分
+      数値の直後の文字（mm, W など）はその数値の単位。単位のない数値は、同じ括弧区間の
+      隣の数値の単位を借りる（#±#mm の1つ目は mm）。それ以外の文字はそのまま一致。空白の有無は問わない。
+    """
+    t = re.sub(r"\s+", " ", normalize_text(pattern))
+    out: list[str] = ["^"]
+    order: list[tuple[str, int, bool]] = []      # (名前, 括弧区間, 自前の単位があるか)
+    seg, auto, i, prev_sign, depth = 0, 0, 0, False, 0
+    while i < len(t):
+        c = t[i]
+        if c in "#{":
+            if c == "{":
+                j = t.find("}", i)
+                if j < 0:
+                    raise ValueError("{ が閉じていません")
+                name = t[i + 1:j]
+                if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) or name.startswith("u_"):
+                    raise ValueError(f"{{{name}}} は英数字と _ の名前にしてください（u_ で始まる名前は不可）")
+                i = j + 1
+            else:
+                auto += 1
+                name, i = f"n{auto}", i + 1
+            if any(name == o[0] for o in order):
+                raise ValueError(f"数値の名前 {name!r} が重複しています")
+            out.append(f"(?P<{name}>{_UNS if prev_sign else _NUM})")
+            m = _PAT_UNIT.match(t, i)
+            if m:
+                out.append(rf"\s*(?P<u_{name}>{re.escape(m.group())})")
+                i = m.end()
+            order.append((name, seg, bool(m)))
+            prev_sign = False
+        elif c == "[":
+            out.append("(?:")
+            depth += 1
+            i += 1
+        elif c == "]":
+            if depth == 0:
+                raise ValueError("] に対応する [ がありません")
+            out.append(")?")
+            depth -= 1
+            i += 1
+        elif c == " ":
+            out.append(r"\s*")
+            i += 1
+        elif c in "~〜":
+            out.append(r"\s*[~〜]\s*")
+            prev_sign = False
+            i += 1
+        else:
+            if c in "()":
+                seg += 1
+            out.append(re.escape(c) if c.isalnum() else rf"\s*{re.escape(c)}\s*")
+            prev_sign = c in "±+-"
+            i += 1
+    if depth:
+        raise ValueError("[ が閉じていません")
+    if not order:
+        raise ValueError("数値（# か {名前}）が1つもありません")
+    unit_order: dict[str, list[str]] = {}
+    for k, (name, sg, own) in enumerate(order):
+        cand = [f"u_{name}"] if own else []
+        cand += [f"u_{n}" for n, s2, o in order[k + 1:] if s2 == sg and o]
+        cand += [f"u_{n}" for n, s2, o in reversed(order[:k]) if s2 == sg and o]
+        unit_order[name] = cand
+    return "".join(out) + "$", unit_order
 
 
 class ConfigError(Exception):
@@ -89,6 +172,11 @@ class FieldRule:
     unit_label: str | None = None
     decimals: int | None = None
     trim: bool = True
+    label: str = ""                  # どの書式か（pattern の文字列、preset:名前、match）
+    # case 形式: 上から順に試し、最初に一致した書式の部品(alts)を使う
+    case_rx: list[re.Pattern] = field(default_factory=list)
+    case_labels: list[str] = field(default_factory=list)
+    alts: dict[int, "FieldRule"] = field(default_factory=dict)
 
 
 @dataclass
@@ -116,6 +204,7 @@ class Config:
     keep: list[str] = field(default_factory=list)
     reserved: list[re.Pattern] = field(default_factory=list)
     on_error: str = "keep"
+    tests: list[dict] = field(default_factory=list)   # [[test]]: {name, in, out, codes}
 
 
 def _unknown(prefix: str, d: dict, allowed: set[str], problems: list[str]) -> None:
@@ -181,6 +270,80 @@ def _mk_field(f: dict, w: str, units: UnitTable, synonyms: dict, p: list[str]) -
     return fr
 
 
+def _matcher_parts(f: dict, src: str, drop: bool, w: str, units: UnitTable, synonyms: dict,
+                   p: list[str]) -> tuple[re.Pattern, str, list[FieldRule]] | None:
+    """preset / match / pattern のどれか1つ + parts を、部品ごとの FieldRule にする。"""
+    kinds = [k for k in ("preset", "match", "pattern") if k in f]
+    if len(kinds) != 1:
+        p.append(f"{w}: preset / match / pattern のどれか1つを parts と一緒に書きます"
+                 if kinds else f"{w}: match と parts は一緒に書きます")
+        return None
+    kind = kinds[0]
+    unit_order: dict[str, list[str]] | None = None
+    if kind == "preset":
+        pre = PRESETS.get(f["preset"])
+        if pre is None:
+            p.append(f"{w}: preset = {f['preset']!r} は未対応（使えるもの: {', '.join(PRESETS)}）")
+            return None
+        rx, unit_order, label = re.compile(pre[0]), pre[1], f"preset:{f['preset']}"
+    elif kind == "pattern":
+        try:
+            src_rx, unit_order = compile_pattern(str(f["pattern"]))
+            rx = re.compile(src_rx)
+        except (ValueError, re.error) as e:
+            p.append(f"{w}: pattern が不正 ({e})")
+            return None
+        label = str(f["pattern"])
+    else:
+        try:
+            rx = re.compile(f["match"])
+        except re.error as e:
+            p.append(f"{w}: match の正規表現が不正 ({e})")
+            return None
+        label = "match"
+    names = list(unit_order) if unit_order is not None else list(rx.groupindex)
+    if "parts" not in f and kind == "match":
+        p.append(f"{w}: match と parts は一緒に書きます")
+        return None
+    if not isinstance(f.get("parts"), dict) or not f["parts"]:
+        if kind == "match":
+            p.append(f"{w}: parts は {{ グループ名 = {{ out = ... }} }} の形で書きます")
+        else:
+            p.append(f"{w}: parts が必要です（例: parts = {{ {names[0]} = {{ out = \"x\", to = \"V\" }} }}、"
+                     f"使える名前: {', '.join(names)}）")
+        return None
+    res: list[FieldRule] = []
+    for gname, pd in f["parts"].items():
+        pw = f"{w}.parts.{gname}"
+        if not isinstance(pd, dict):
+            p.append(f"{pw}: {{ out = ... }} の形で書きます")
+            continue
+        _unknown(pw, pd, _PART_KEYS, p)
+        if gname not in names:
+            if kind == "match":
+                p.append(f"{pw}: match に名前付きグループ (?P<{gname}>...) がありません")
+            else:
+                p.append(f"{pw}: {kind} {f[kind]!r} の部品名は {', '.join(names)} です")
+            continue
+        if "out" not in pd:
+            p.append(f"{pw}: out が必要です")
+            continue
+        ug = pd.get("unit_group")
+        for g in ([ug] if isinstance(ug, str) else ug or []):
+            if g not in rx.groupindex:
+                p.append(f"{pw}: unit_group = {g!r} が {kind} にありません")
+        fr = _mk_field({**pd, "src": src}, pw, units, synonyms, p)
+        if fr:
+            fr.extract, fr.group, fr.label = rx, gname, label
+            if unit_order is None:
+                fr.unit_group = ug
+            else:
+                fr.unit_group = ug or ((unit_order[gname] or None) if (fr.to or fr.number_only) else None)
+            fr.drop_src = drop
+            res.append(fr)
+    return rx, label, res
+
+
 def load_config(path: str | Path) -> Config:
     try:
         with open(path, "rb") as f:
@@ -236,64 +399,38 @@ def config_from_dict(raw: dict) -> Config:
             p.append(f"{w}: src が必要です")
             continue
         w += f"({f['src']})"
-        if "preset" in f:
-            _unknown(w, f, {"src", "preset", "parts", "drop_src"}, p)
-            pre = PRESETS.get(f["preset"])
-            if pre is None:
-                p.append(f"{w}: preset = {f['preset']!r} は未対応（使えるもの: {', '.join(PRESETS)}）")
+        if "case" in f:
+            _unknown(w, f, {"src", "case", "drop_src"}, p)
+            if not isinstance(f["case"], list) or not f["case"]:
+                p.append(f"{w}: case は [[field.case]] を1つ以上書きます")
                 continue
-            rx, unit_order = re.compile(pre[0]), pre[1]
-            if not isinstance(f.get("parts"), dict) or not f["parts"]:
-                p.append(f"{w}: parts が必要です（例: parts = {{ nom = {{ out = \"x\", to = \"V\" }} }}、"
-                         f"使える名前: {', '.join(unit_order)}）")
-                continue
-            for gname, pd in f["parts"].items():
-                pw = f"{w}.parts.{gname}"
-                _unknown(pw, pd, _PART_KEYS, p)
-                if gname not in unit_order:
-                    p.append(f"{pw}: preset {f['preset']!r} の部品名は {', '.join(unit_order)} です")
+            rxs, labels, by_out = [], [], {}
+            for k, cs in enumerate(f["case"]):
+                cw = f"{w}.case#{k + 1}"
+                _unknown(cw, cs, {"preset", "match", "pattern", "parts"}, p)
+                got = _matcher_parts(cs, f["src"], False, cw, units, synonyms, p)
+                if got is None:
                     continue
-                if "out" not in pd:
-                    p.append(f"{pw}: out が必要です")
-                    continue
-                fr = _mk_field({**pd, "src": f["src"]}, pw, units, synonyms, p)
-                if fr:
-                    fr.extract, fr.group = rx, gname
-                    fr.unit_group = pd.get("unit_group") or (unit_order[gname] if (fr.to or fr.number_only) else None)
-                    fr.drop_src = bool(f.get("drop_src", False))
-                    fields.append(fr)
+                rx, label, parts = got
+                seen_out = set()
+                for fr in parts:
+                    if fr.sub:
+                        p.append(f"{cw}.parts: case の中では sub は使えません")
+                    if fr.out in seen_out:
+                        p.append(f"{cw}: 出力列名 {fr.out!r} が同じ case の中で重複しています")
+                    seen_out.add(fr.out)
+                    by_out.setdefault(fr.out, {})[len(rxs)] = fr
+                rxs.append(rx)
+                labels.append(label)
+            for out, alts in by_out.items():
+                fields.append(FieldRule(src=f["src"], out=out, drop_src=bool(f.get("drop_src", False)),
+                                        case_rx=rxs, case_labels=labels, alts=alts))
             continue
-        if "match" in f or "parts" in f:
-            _unknown(w, f, {"src", "match", "parts", "drop_src"}, p)
-            if "match" not in f or "parts" not in f:
-                p.append(f"{w}: match と parts は一緒に書きます")
-                continue
-            try:
-                rx = re.compile(f["match"])
-            except re.error as e:
-                p.append(f"{w}: match の正規表現が不正 ({e})")
-                continue
-            if not isinstance(f["parts"], dict) or not f["parts"]:
-                p.append(f"{w}: parts は {{ グループ名 = {{ out = ... }} }} の形で書きます")
-                continue
-            for gname, pd in f["parts"].items():
-                pw = f"{w}.parts.{gname}"
-                _unknown(pw, pd, _PART_KEYS, p)
-                if gname not in rx.groupindex:
-                    p.append(f"{pw}: match に名前付きグループ (?P<{gname}>...) がありません")
-                    continue
-                if "out" not in pd:
-                    p.append(f"{pw}: out が必要です")
-                    continue
-                ug = pd.get("unit_group")
-                for g in ([ug] if isinstance(ug, str) else ug or []):
-                    if g not in rx.groupindex:
-                        p.append(f"{pw}: unit_group = {g!r} が match にありません")
-                fr = _mk_field({**pd, "src": f["src"]}, pw, units, synonyms, p)
-                if fr:
-                    fr.extract, fr.group, fr.unit_group = rx, gname, ug
-                    fr.drop_src = bool(f.get("drop_src", False))
-                    fields.append(fr)
+        if "preset" in f or "match" in f or "pattern" in f or "parts" in f:
+            _unknown(w, f, {"src", "preset", "match", "pattern", "parts", "drop_src"}, p)
+            got = _matcher_parts(f, f["src"], bool(f.get("drop_src", False)), w, units, synonyms, p)
+            if got:
+                fields.extend(got[2])
         else:
             _unknown(w, f, _FIELD_KEYS, p)
             fr = _mk_field(f, w, units, synonyms, p)
@@ -363,9 +500,27 @@ def config_from_dict(raw: dict) -> Config:
                 p.append(f"[[derive]]({dr.out}): {col!r} はこの後で定義されています（依存順に並べてください）")
         seen.add(dr.out)
 
+    tests: list[dict] = []
+    for i, t in enumerate(raw.get("test", [])):
+        w = f"[[test]]#{i + 1}"
+        _unknown(w, t, _TEST_KEYS, p)
+        if not isinstance(t.get("in"), dict) or not t["in"]:
+            p.append(f"{w}: in = {{ 列名 = \"値\" }} が必要です")
+            continue
+        if not isinstance(t.get("out", {}), dict) or not isinstance(t.get("codes", []), list):
+            p.append(f"{w}: out は {{ 列名 = \"期待値\" }}、codes は [\"C111\"] の形で書きます")
+            continue
+        if "out" not in t and "codes" not in t:
+            p.append(f"{w}: out（期待する出力）か codes（期待する報告コード）が必要です")
+            continue
+        tests.append({"name": str(t.get("name", f"#{i + 1}")),
+                      "in": {str(k): str(v) for k, v in t["in"].items()},
+                      "out": {str(k): str(v) for k, v in t.get("out", {}).items()},
+                      "codes": sorted(str(c) for c in t.get("codes", []))})
+
     if p:
         raise ConfigError(p)
-    return Config(units=units, fields=fields, derives=derives, synonyms=synonyms,
+    return Config(tests=tests, units=units, fields=fields, derives=derives, synonyms=synonyms,
                   encoding_in=st.get("encoding_in", "utf-8-sig"),
                   encoding_out=st.get("encoding_out", "utf-8-sig"),
                   passthrough=bool(st.get("passthrough", True)),
@@ -418,6 +573,17 @@ def _is_reserved(cfg: Config, s: str) -> bool:
     return any(r.search(s) for r in cfg.reserved)
 
 
+def select_case(fr: FieldRule, raw: str) -> int | None:
+    """case 形式で、値がどの書式に一致するか。一致した番号 / -1=どれにも不一致 / None=空。"""
+    text = normalize_text(raw)
+    if text == "":
+        return None
+    for k, rx in enumerate(fr.case_rx):
+        if rx.search(text):
+            return k
+    return -1
+
+
 def _apply_field(cfg: Config, fr: FieldRule, raw: str, nums: dict, rowctx: tuple,
                  issues: list[Issue], trace: list | None = None) -> str:
     row, key = rowctx
@@ -432,6 +598,20 @@ def _apply_field(cfg: Config, fr: FieldRule, raw: str, nums: dict, rowctx: tuple
     if _is_reserved(cfg, raw):
         tr("reserved", raw)
         return raw  # chozuの抽出NG印などは触らず通す
+    if fr.case_rx:
+        k = select_case(fr, raw)
+        if k is None:
+            return ""
+        if k < 0:
+            tr("case", "どの書式にも不一致")
+            nums[fr.out] = (None, None)
+            issue("C111", "E", f"どの case にも一致しません（形: {shape_of(raw)}）")
+            return "" if (cfg.on_error == "empty" or fr.out != fr.src) else raw
+        tr("case", f"#{k + 1} {fr.case_labels[k]}")
+        alt = fr.alts.get(k)
+        if alt is None:
+            return ""       # この書式には、この出力列にあたる部分がない
+        return _apply_field(cfg, alt, raw, nums, rowctx, issues, trace)
     text = normalize_text(raw)
     tr("normalize", text)
     if text == "":

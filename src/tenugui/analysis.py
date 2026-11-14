@@ -9,8 +9,8 @@ from collections import Counter
 from dataclasses import replace
 from pathlib import Path
 
-from .core import (Config, Issue, _apply_field, _is_reserved, check_header, convert_rows,
-                   survey as _survey, uniquify)
+from .core import (Config, FieldRule, Issue, _apply_field, _is_reserved, check_header, compile_pattern,
+                   convert_rows, select_case, shape_of, survey as _survey, uniquify)
 from .units import UnitError, UnitTable, fold_key, normalize_text, parse_quantity
 
 # ---------------------------------------------------------------- 修正のヒント
@@ -20,7 +20,8 @@ HINTS = {
     "C101": "数値+単位として読めない。複合表記なら match/parts か extract/sub で数値部分だけ取り出す",
     "C102": "単位が無い値。default_unit を指定するか、入力側に単位を付ける",
     "C103": "未定義の単位か次元違い。[units.*] / [unit_alias] に追加するか、to を見直す",
-    "C111": "match/extract が外れた。tenugui try で値を試し、正規表現を直す",
+    "C104": "strip_units に無い単位。単位を換算するなら to、捨ててよいなら strip_units に足す",
+    "C111": "書式が外れた。tenugui suggest で追加すべき case の案を得るか、tenugui try で値を試す",
     "C121": "同義語表に無い値。[synonyms.*] に追加するか on_unknown を見直す（survey の candidates 参照）",
     "C201": "必須項目が空。入力データの欠落か、match の該当部分が無い",
     "C301": "派生の入力が数値として読めない。上流の field で数値化する",
@@ -174,9 +175,265 @@ def survey_full(cfg: Config, header: list[str], rows: list[list[str]], column: s
             parse_quantity(v, cfg.units)
         except UnitError:
             textual[v] = n
+    s["shapes"] = shape_counts(vals)
     s["candidates"] = synonym_candidates(textual)
     s["composite_examples"] = [v for v in vals if any(ch in v for ch in "±×～~") and any(c.isdigit() for c in v)][:3]
     return s
+
+
+# ---------------------------------------------------------------- 形の集計
+def shape_counts(vals: Counter, top: int = 20, examples: int = 3) -> list[dict]:
+    """値の「形」（数値を # にしたもの）ごとの件数と例。件数の多い順。"""
+    by: dict[str, Counter] = {}
+    for v, n in vals.items():
+        by.setdefault(shape_of(v), Counter())[v] += n
+    res = [{"shape": sh, "count": sum(c.values()), "distinct": len(c),
+            "examples": [v for v, _ in c.most_common(examples)]} for sh, c in by.items()]
+    return sorted(res, key=lambda d: (-d["count"], d["shape"]))[:top]
+
+
+def survey_overview(cfg: Config, header: list[str], rows: list[list[str]], top: int = 5) -> list[dict]:
+    """全列の概況: 値の種類数と形の種類数。形が複数ある列が、ばらつきのある列。"""
+    uh, _ = uniquify(header)
+    res = []
+    for i, col in enumerate(uh):
+        vals = Counter(normalize_text(r[i]) for r in rows if i < len(r))
+        ng = sum(n for v, n in vals.items() if v and _is_reserved(cfg, v))
+        vals = Counter({v: n for v, n in vals.items() if v and not _is_reserved(cfg, v)})
+        allsh = shape_counts(vals, top=10 ** 6)
+        res.append({"column": col, "filled": sum(vals.values()), "ng": ng, "distinct": len(vals),
+                    "shape_count": len(allsh), "shapes": allsh[:top]})
+    return res
+
+
+# ---------------------------------------------------------------- 問題のグループ化
+def group_issues(issues: list[Issue], examples: int = 3, rows: int = 5) -> list[dict]:
+    """問題を「列 × コード × 値の形」でまとめる。件数の多い順。行ごとの一覧より桁違いに短い。"""
+    by: dict[tuple, dict] = {}
+    for i in issues:
+        k = (i.column, i.out if i.code != "C111" else "", i.code, shape_of(i.raw) if i.raw else "")
+        g = by.setdefault(k, {"column": i.column, "out": k[1], "code": i.code, "severity": i.severity,
+                              "shape": k[3], "count": 0, "examples": [], "rows": [],
+                              "message": i.message, "hint": HINTS.get(i.code, "")})
+        g["count"] += 1
+        if i.raw and i.raw not in g["examples"] and len(g["examples"]) < examples:
+            g["examples"].append(i.raw)
+        if len(g["rows"]) < rows:
+            g["rows"].append(i.row)
+    return sorted(by.values(), key=lambda d: (-d["count"], d["column"], d["code"], d["shape"]))
+
+
+def case_coverage(cfg: Config, header: list[str], rows: list[list[str]]) -> list[dict]:
+    """case 形式の列ごとに、どの書式で何件通ったか。"""
+    uh, _ = uniquify(header)
+    idx = {h: i for i, h in enumerate(uh)}
+    res, done = [], set()
+    for fr in cfg.fields:
+        if not fr.case_rx or fr.src in done or fr.src not in idx:
+            continue
+        done.add(fr.src)
+        cnt: Counter = Counter()
+        i = idx[fr.src]
+        for r in rows:
+            raw = r[i] if i < len(r) else ""
+            if _is_reserved(cfg, raw):
+                cnt["ng"] += 1
+                continue
+            k = select_case(fr, raw)
+            cnt["empty" if k is None else k] += 1
+        res.append({"column": fr.src,
+                    "cases": [{"case": k + 1, "label": lb, "count": cnt[k]} for k, lb in enumerate(fr.case_labels)],
+                    "unmatched": cnt[-1], "empty": cnt["empty"], "ng": cnt["ng"]})
+    return res
+
+
+# ---------------------------------------------------------------- 回帰テスト（[[test]]）
+def run_tests(cfg: Config) -> dict:
+    """設定内の [[test]] を実行。期待と違う出力・報告コードを failures に入れる。"""
+    results = []
+    for t in cfg.tests:
+        r = try_row(cfg, t["in"])
+        diffs = [{"column": c, "expected": exp, "actual": r["outputs"].get(c)}
+                 for c, exp in t["out"].items() if r["outputs"].get(c) != exp]
+        codes = sorted({i["code"] for i in r["issues"]})
+        if codes != sorted(set(t["codes"])):
+            diffs.append({"column": "(codes)", "expected": ",".join(sorted(set(t["codes"]))) or "(なし)",
+                          "actual": ",".join(codes) or "(なし)"})
+        results.append({"name": t["name"], "ok": not diffs, "in": t["in"], "diffs": diffs})
+    failed = [r for r in results if not r["ok"]]
+    return {"total": len(results), "failed": len(failed), "ok": not failed, "failures": failed}
+
+
+def test_block(values: dict[str, str], res: dict, name: str = "") -> str:
+    """try の結果を、そのまま設定に貼れる [[test]] にする。"""
+    outs = {c: v for c, v in res["outputs"].items() if c not in values or values[c] != v}
+    L = ["[[test]]"]
+    if name:
+        L.append(f"name = {_q(name)}")
+    L.append("in = { " + ", ".join(f"{_q(k)} = {_q(v)}" for k, v in values.items()) + " }")
+    L.append("out = { " + ", ".join(f"{_q(k)} = {_q(v)}" for k, v in outs.items()) + " }")
+    codes = sorted({i["code"] for i in res["issues"]})
+    if codes:
+        L.append("codes = [" + ", ".join(_q(c) for c in codes) + "]")
+    return "\n".join(L) + "\n"
+
+
+# ---------------------------------------------------------------- ルール変更の影響（出力同士の比較）
+def compare_outputs(h1: list[str], r1: list[list[str]], h2: list[str], r2: list[list[str]],
+                    samples: int = 5) -> dict:
+    """2つの出力（変更前 / 変更後）を行番号で突き合わせ、列の増減と値が変わったセルを数える。"""
+    i1 = {c: i for i, c in enumerate(h1)}
+    i2 = {c: i for i, c in enumerate(h2)}
+    cols = []
+    for c in h1:
+        if c not in i2:
+            continue
+        a, b, n, sm = i1[c], i2[c], 0, []
+        for row, (x, y) in enumerate(zip(r1, r2), start=1):
+            vx = x[a] if a < len(x) else ""
+            vy = y[b] if b < len(y) else ""
+            if vx != vy:
+                n += 1
+                if len(sm) < samples:
+                    sm.append({"row": row, "key": x[0] if x else "", "before": vx, "after": vy})
+        if n:
+            cols.append({"column": c, "changed": n, "samples": sm})
+    added = [c for c in h2 if c not in i1]
+    removed = [c for c in h1 if c not in i2]
+    changed = sum(c["changed"] for c in cols)
+    return {"same": not (added or removed or changed or len(r1) != len(r2)),
+            "rows_before": len(r1), "rows_after": len(r2), "columns_added": added,
+            "columns_removed": removed, "changed_cells": changed,
+            "columns": sorted(cols, key=lambda d: -d["changed"])}
+
+
+def impact(base: Config, new: Config, header: list[str], rows: list[list[str]]) -> dict:
+    """同じ入力を 変更前の設定 / 変更後の設定 で変換し、出力と問題件数の違いを返す。"""
+    h1, r1, s1 = convert_rows(base, header, rows)
+    h2, r2, s2 = convert_rows(new, header, rows)
+    res = compare_outputs(h1, r1, h2, r2)
+
+    def cnt(iss):
+        e = sum(1 for i in iss if i.severity == "E")
+        return {"error": e, "warning": len(iss) - e}
+
+    res["issues_before"], res["issues_after"] = cnt(s1), cnt(s2)
+    k1 = Counter((i.column, i.out, i.code) for i in s1)
+    k2 = Counter((i.column, i.out, i.code) for i in s2)
+    res["issue_changes"] = [{"column": k[0], "out": k[1], "code": k[2], "before": k1[k], "after": k2[k]}
+                            for k in sorted(set(k1) | set(k2)) if k1[k] != k2[k]]
+    return res
+
+
+# ---------------------------------------------------------------- suggest（修正案）
+def _part_toml(fr: FieldRule | None, out: str) -> str:
+    items = [f"out = {_q(out)}"]
+    if fr is not None and fr.alts:
+        fr = next(iter(fr.alts.values()))
+    if fr is not None:
+        if fr.number_only:
+            items += ["number_only = true",
+                      "strip_units = [" + ", ".join(_q(u) for u in sorted(fr.strip_units)) + "]"]
+        if fr.to:
+            items.append(f"to = {_q(fr.to)}")
+            if fr.default_unit:
+                items.append(f"default_unit = {_q(fr.default_unit)}")
+            if fr.unit_out == "add":
+                items.append('unit_out = "add"')
+        if fr.decimals is not None:
+            items.append(f"decimals = {fr.decimals}")
+    return "{ " + ", ".join(items) + " }"
+
+
+def _pattern_for(shape: str, examples: list[str]) -> tuple[str, list[str]] | None:
+    """形をそのまま pattern として使えるか確かめる。使えれば (pattern, 数値名)。"""
+    if any(ch in normalize_text(e) for e in examples for ch in "#[]{}"):
+        return None
+    try:
+        rx, order = compile_pattern(shape)
+    except (ValueError, re.error):
+        return None
+    c = re.compile(rx)
+    if not all(c.search(normalize_text(e)) for e in examples):
+        return None
+    return shape, list(order)
+
+
+def suggest(cfg: Config, header: list[str], rows: list[list[str]]) -> list[dict]:
+    """問題のグループごとに、設定の修正案（TOML断片）を付ける。案は推測なので、
+    適用したら check と test で確かめること。"""
+    _, _, issues = convert_rows(cfg, header, rows)
+    by_src: dict[str, list[FieldRule]] = {}
+    for fr in cfg.fields:
+        by_src.setdefault(fr.src, []).append(fr)
+    out = []
+    for g in group_issues([i for i in issues if i.code in
+                           ("C101", "C102", "C103", "C104", "C111", "C121")]):
+        frs = by_src.get(g["column"], [])
+        target = next((f for f in frs if f.out == g["out"]), frs[0] if frs else None)
+        sug = {"kind": "none", "toml": "", "note": "自動の案はありません。hint を参照", "confidence": "none"}
+        if g["code"] in ("C111", "C101") and target is not None:
+            pat = _pattern_for(g["shape"], g["examples"])
+            if pat:
+                pattern, names = pat
+                outs = list(dict.fromkeys(f.out for f in frs))
+                matcher = bool(target.case_rx or target.group)
+                parts = []
+                for k, n in enumerate(names):
+                    if matcher and k < len(outs):
+                        parts.append(f"{n} = {_part_toml(next(f for f in frs if f.out == outs[k]), outs[k])}")
+                    elif matcher:
+                        parts.append(f"{n} = {_part_toml(None, g['column'] + '_' + n)}")
+                    else:
+                        parts.append(f"{n} = {_part_toml(target, g['column'] + '_' + n)}")
+                body = f"pattern = {_q(pattern)}\nparts = {{ {', '.join(parts)} }}\n"
+                if target.case_rx:
+                    sug = {"kind": "add_case", "toml": "[[field.case]]\n" + body, "confidence": "medium",
+                           "note": f"src = {g['column']!r} の [[field]] の最後に、この case を足す。"
+                                   "部品と出力列の対応は左からの順で当てた推測なので確認する"}
+                elif matcher:
+                    sug = {"kind": "to_case", "toml": "[[field.case]]\n" + body, "confidence": "medium",
+                           "note": f"src = {g['column']!r} の [[field]] を case 形式に直す: 今の "
+                                   f"{'preset / match / pattern'} と parts を1つ目の [[field.case]] に移し、"
+                                   "この case を2つ目に足す。部品と出力列の対応は推測なので確認する"}
+                else:
+                    sug = {"kind": "to_pattern", "toml": f"[[field]]\nsrc = {_q(g['column'])}\n" + body,
+                           "confidence": "low",
+                           "note": "1つの値に数値が複数ある。この列を pattern と parts で分ける案。"
+                                   "出力列名は仮なので付け直す。他の形の値もあるなら case 形式にする"}
+        elif g["code"] == "C104" and target is not None:
+            m = re.search(r"指定外の単位 '(.+?)'", g["message"])
+            fr = next(iter(target.alts.values())) if target.alts else target
+            have = sorted(u for u in fr.strip_units if u != "*")
+            if m and have:
+                u = m.group(1)
+                if cfg.units.known(u) and cfg.units.known(have[0]) and cfg.units.same_dim(u, have[0]):
+                    sug = {"kind": "use_to", "confidence": "medium",
+                           "toml": f"to = {_q(have[0])}\ndefault_unit = {_q(have[0])}\n",
+                           "note": f"{u} は {have[0]} に換算できる。number_only / strip_units をやめて "
+                                   f"to で {have[0]} に揃える（{u} の値は換算される）"}
+                else:
+                    sug = {"kind": "add_strip_unit", "confidence": "low",
+                           "toml": "strip_units = [" + ", ".join(_q(x) for x in [*have, u]) + "]\n",
+                           "note": f"{u} を捨ててよい単位に足す案。{have[0]} と {u} の数値が同じ列に混ざるので、"
+                                   "意味が同じ場合だけ使う"}
+        elif g["code"] == "C102" and target is not None:
+            fr = next(iter(target.alts.values())) if target.alts else target
+            if fr.to:
+                sug = {"kind": "add_default_unit", "toml": f"default_unit = {_q(fr.to)}\n", "confidence": "low",
+                       "note": f"単位なしの値を {fr.to} とみなす案。本当に {fr.to} の値か確認する"}
+        elif g["code"] == "C121" and target is not None and target.synonyms:
+            table = cfg.synonyms.get(target.synonyms, {})
+            canon = sorted(set(table.values()))
+            ex = g["examples"][0] if g["examples"] else ""
+            near = difflib.get_close_matches(fold_key(ex), [fold_key(c) for c in canon], n=1, cutoff=0.6)
+            if near:
+                c = next(c for c in canon if fold_key(c) == near[0])
+                sug = {"kind": "add_synonym", "toml": f"# [synonyms.{target.synonyms}] の {_q(c)} の配列に足す\n"
+                                                      f"{_q(c)} = [..., {_q(ex)}]\n",
+                       "confidence": "low", "note": f"{ex!r} は {c!r} の表記ゆれに見える。同じものか確認する"}
+        out.append({**g, "suggestion": sug})
+    return out
 
 
 # ---------------------------------------------------------------- draft（ルールの下書き）
