@@ -11,7 +11,7 @@ from pathlib import Path
 
 from .core import (Config, FieldRule, Issue, _apply_field, _is_reserved, check_header, compile_pattern, is_null,
                    convert_rows, select_case, shape_of, survey as _survey, uniquify)
-from .corrections import KIND_LABEL, Provenance, fix_cells, summarize, unused_entries
+from .corrections import KIND_LABEL, Provenance, summarize, unused_entries
 from .units import UnitError, UnitTable, fold_key, normalize_text, parse_quantity
 
 # ---------------------------------------------------------------- 修正のヒント
@@ -715,7 +715,7 @@ def convert_to_files(cfg: Config, config_path: str, input_path: str, header: lis
     detail_files=True で、従来の 変換レポートCSV・差分CSV・ログ も書く。印字はしない。
     report_unused=False は、複数ファイルの一括変換用（当たらなかった訂正・保留は全ファイルを見てから判断する）。"""
     from . import __version__
-    from .core import write_csv, write_report
+    from .core import outputs_from, write_csv, write_report
     from .report import build_report, render_html, write_json
     uh, dups = uniquify(header)
     drift = header_drift(config_path, header) if config_path else None
@@ -726,8 +726,8 @@ def convert_to_files(cfg: Config, config_path: str, input_path: str, header: lis
     htmlp, jsonp = out.with_suffix(".html"), out.with_suffix(".json")
     files = {"output": str(out), "html": str(htmlp), "json": str(jsonp)}
     changes = diff_changes(header, rows, out_header, out_rows)
-    pv = summarize(cfg.corrections, prov, changes, uh, report_unused)
-    cells = fix_cells(prov)
+    pv = summarize(cfg.corrections, prov, changes, uh, report_unused, lambda c: outputs_from(cfg, c))
+    cells = pv["cells"]
     fixp = out.with_name(out.stem + "_fix.csv")
     if cfg.corrections is not None:     # 訂正ファイルを使っているときだけ書く（当たりが無ければ見出しだけ）
         _write_fix(fixp, cells, cfg.encoding_out)

@@ -170,15 +170,18 @@ def read_corrections(path: str | Path) -> tuple[dict, str, list[str]]:
 
 
 # ---------------------------------------------------------------- 来歴のまとめ
-def fix_cells(prov: Provenance) -> list[dict]:
-    """訂正・保留のかかったセルの一覧（行順）。修正依頼リストCSVの中身。"""
+def fix_cells(prov: Provenance, outputs_of: Callable[[str], list[str]] | None = None) -> list[dict]:
+    """訂正・保留のかかったセルの一覧（行順、全件）。修正依頼リストCSVの中身。
+    outputs_of を渡すと、その列の値から作られる出力列（別名の列・派生）を outputs に入れる。
+    後段のツールが「保留なので未検査にする列」を知るために使う。"""
     res = []
-    for (row, col), (raw, e) in prov.corrected.items():
-        res.append({"kind": "correct", "row": row, "key": prov.keys.get(row, ""), "column": col,
-                    "before": raw, "after": e.to, "reason": e.reason, "ref": e.ref})
-    for (row, col), (raw, e) in prov.held.items():
-        res.append({"kind": "hold", "row": row, "key": prov.keys.get(row, ""), "column": col,
-                    "before": raw, "after": "", "reason": e.reason, "ref": e.ref})
+    for kind, cells in (("correct", prov.corrected), ("hold", prov.held)):
+        for (row, col), (raw, e) in cells.items():
+            d = {"kind": kind, "row": row, "key": prov.keys.get(row, ""), "column": col,
+                 "before": raw, "after": e.to, "reason": e.reason, "ref": e.ref}
+            if outputs_of is not None:
+                d["outputs"] = outputs_of(col)
+            res.append(d)
     return sorted(res, key=lambda d: (d["row"], d["column"]))
 
 
@@ -234,13 +237,13 @@ def glossary_used(prov: Provenance) -> list[dict]:
 
 
 def summarize(cor: Corrections | None, prov: Provenance, changes: list[dict], header: list[str],
-              report_unused: bool = True) -> dict:
+              report_unused: bool = True, outputs_of: Callable[[str], list[str]] | None = None) -> dict:
     """レポートに載せる来歴（JSON の provenance）。changes の各要素に kind も付ける。"""
     for ch in changes:
         ch["kind"] = "correct" if (ch["row"], ch["column"]) in prov.corrected else "normalize"
     return {"corrections_file": cor.path if cor else None, "corrections_sha": cor.sha if cor else "",
             "counts": {"normalize": sum(1 for ch in changes if ch["kind"] == "normalize"),
                        "correct": len(prov.corrected), "hold": len(prov.held)},
-            "fix_requests": fix_requests(prov),
+            "fix_requests": fix_requests(prov), "cells": fix_cells(prov, outputs_of),
             "unused": unused_entries(cor, prov, header) if report_unused else [],
             "glossary": glossary_used(prov)}

@@ -927,6 +927,17 @@ def _apply_derive(cfg: Config, dr: DeriveRule, vals: dict, nums: dict, rowctx: t
     return s
 
 
+def outputs_from(cfg: Config, column: str) -> list[str]:
+    """入力の列 column の値から作られる出力列: その列のルールの出力と、それを使う派生（さらにその先も）。"""
+    outs = [fr.out for fr in cfg.fields if fr.src == column]
+    reach = {column, *outs}
+    for dr in cfg.derives:                       # 派生は宣言順に評価するので、1回なめれば足りる
+        if any(col in reach for col, _ in dr.vars.values()):
+            reach.add(dr.out)
+            outs.append(dr.out)
+    return list(dict.fromkeys(outs))
+
+
 def dedupe_issues(issues: list[Issue]) -> list[Issue]:
     """同じ原因の重複を畳む。match が外れると parts の数だけ同じ C111 が出るため。"""
     seen: set = set()

@@ -75,7 +75,7 @@ def build_report(*, version: str, command: str, input_path: str, config_path: st
             "header_drift": drift,
             "provenance": provenance or {"corrections_file": None, "corrections_sha": "",
                                          "counts": {"normalize": len(changes), "correct": 0, "hold": 0},
-                                         "fix_requests": [], "unused": [], "glossary": []}}
+                                         "fix_requests": [], "cells": [], "unused": [], "glossary": []}}
 
 
 def write_json(path: str | Path, rep: dict) -> None:

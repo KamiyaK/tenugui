@@ -211,6 +211,8 @@ def test_convert_reports_provenance_and_writes_fix_list(work, capsys):
     assert [(g["kind"], g["column"], g["value"], g["to"], g["keys"]) for g in pv["fix_requests"]] == [
         ("hold", "volt", "100/200V", "", ["P3"]), ("correct", "dia", "35nm", "35mm", ["P2"])]
     assert pv["unused"] == [] and j["verification"]["ok"]
+    assert [(c["kind"], c["row"], c["column"], c["outputs"]) for c in pv["cells"]] == [
+        ("correct", 2, "dia", ["dia_mm", "half"]), ("hold", 3, "volt", ["volt"])]      # 後段が未検査にする列
     assert pv["glossary"][0]["canonical"] == "標準型" and pv["glossary"][0]["unified"] == 2
     fix = list(csv.reader(Path(j["files"]["fix"]).read_text(encoding="utf-8-sig").splitlines()))
     assert fix[0][:6] == ["種類", "row", "key", "column", "元の値", "訂正後"]
