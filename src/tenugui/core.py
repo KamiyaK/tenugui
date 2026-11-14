@@ -13,6 +13,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Iterable
 
+from .corrections import Corrections, Provenance, corrections_path, parse_corrections, read_corrections
 from .expr import Expr, ExprError, compile_expr
 from .units import (UnitError, UnitTable, fold_key, format_decimal,
                     normalize_text, parse_number, parse_quantity)
@@ -208,6 +209,8 @@ class Config:
     tests: list[dict] = field(default_factory=list)   # [[test]]: {name, in, out, codes}
     rare_shape: float = 0.05     # 列の中でこの割合以下の形は「少数派」として C131 警告。0 で無効
     null_keys: frozenset = frozenset()   # 空として扱う値（[settings] null_values を NFKC・大小無視にしたもの）
+    synonym_tables: dict[str, dict[str, list[str]]] = field(default_factory=dict)   # 書かれたままの同義語表（用語対応表用）
+    corrections: Corrections | None = None    # 訂正・保留（別ファイル）。無ければ None
 
 
 def _unknown(prefix: str, d: dict, allowed: set[str], problems: list[str]) -> None:
@@ -456,7 +459,9 @@ def _matcher_parts(f: dict, src: str, drop: bool, w: str, units: UnitTable, syno
     return rx, label, res
 
 
-def load_config(path: str | Path) -> Config:
+def load_config(path: str | Path, corrections: str | Path | None = None) -> Config:
+    """ルールTOMLを読む。同じ場所に <ルール名>.corrections.toml があれば訂正・保留も読む
+    （corrections で別の場所を指定できる）。"""
     try:
         with open(path, "rb") as f:
             raw = tomllib.load(f)
@@ -465,10 +470,19 @@ def load_config(path: str | Path) -> Config:
     except tomllib.TOMLDecodeError as e:
         raise ConfigError([f"TOMLの構文エラー: {e}（よくある原因: 正規表現を \"...\" で書いた → '...' で書く / "
                            "{ } の中で改行した → 1行で書くか [field.parts.名前] の形にする / 文字列の \" の閉じ忘れ）"]) from None
-    return config_from_dict(raw)
+    cp = Path(corrections) if corrections else corrections_path(path)
+    if not corrections and not cp.exists():
+        return config_from_dict(raw)
+    craw, sha, probs = read_corrections(cp)
+    if probs:
+        raise ConfigError(probs)
+    cfg = config_from_dict(raw, craw)
+    cfg.corrections.path, cfg.corrections.sha = str(cp), sha
+    return cfg
 
 
-def config_from_dict(raw: dict) -> Config:
+def config_from_dict(raw: dict, corrections: dict | None = None) -> Config:
+    """corrections は訂正ファイルを読んだ辞書（[[correct]] / [[hold]]）。"""
     p: list[str] = []
     _unknown("トップレベル", raw, _TOP_KEYS, p)
     if raw.get("schema_version") != SCHEMA_VERSION:
@@ -500,8 +514,10 @@ def config_from_dict(raw: dict) -> Config:
         units = UnitTable()
 
     synonyms: dict[str, dict[str, str]] = {}
+    synonym_tables: dict[str, dict[str, list[str]]] = {}
     for sname, tbl in raw.get("synonyms", {}).items():
         m: dict[str, str] = {}
+        synonym_tables[sname] = {str(c): [str(v) for v in vs] for c, vs in tbl.items() if isinstance(vs, list)}
         for canon, variants in tbl.items():
             if not isinstance(variants, list):
                 p.append(f"[synonyms.{sname}] {canon} は配列で書いてください")
@@ -642,9 +658,13 @@ def config_from_dict(raw: dict) -> Config:
                       "out": {str(k): str(v) for k, v in t.get("out", {}).items()},
                       "codes": sorted(str(c) for c in t.get("codes", []))})
 
+    cor = None
+    if corrections is not None:
+        cor, cp = parse_corrections(corrections, lambda s: any(r.search(s) for r in reserved))
+        p.extend(cp)
     if p:
         raise ConfigError(p)
-    return Config(null_keys=frozenset(null_key(x) for x in nulls), rare_shape=float(rare), tests=tests, units=units, fields=fields, derives=derives, synonyms=synonyms,
+    return Config(corrections=cor, synonym_tables=synonym_tables, null_keys=frozenset(null_key(x) for x in nulls), rare_shape=float(rare), tests=tests, units=units, fields=fields, derives=derives, synonyms=synonyms,
                   encoding_in=st.get("encoding_in", "utf-8-sig"),
                   encoding_out=st.get("encoding_out", "utf-8-sig"),
                   passthrough=bool(st.get("passthrough", True)),
@@ -719,7 +739,7 @@ def select_case(fr: FieldRule, raw: str) -> int | None:
 
 
 def _apply_field(cfg: Config, fr: FieldRule, raw: str, nums: dict, rowctx: tuple,
-                 issues: list[Issue], trace: list | None = None) -> str:
+                 issues: list[Issue], trace: list | None = None, prov: Provenance | None = None) -> str:
     row, key = rowctx
 
     def issue(code: str, sev: str, msg: str) -> None:
@@ -748,7 +768,7 @@ def _apply_field(cfg: Config, fr: FieldRule, raw: str, nums: dict, rowctx: tuple
         alt = fr.alts.get(k)
         if alt is None:
             return ""       # この書式には、この出力列にあたる部分がない
-        return _apply_field(cfg, alt, raw, nums, rowctx, issues, trace)
+        return _apply_field(cfg, alt, raw, nums, rowctx, issues, trace, prov)
     text = normalize_text(raw)
     tr("normalize", text)
     if text == "":
@@ -763,6 +783,9 @@ def _apply_field(cfg: Config, fr: FieldRule, raw: str, nums: dict, rowctx: tuple
     if fr.synonyms:
         hit = cfg.synonyms[fr.synonyms].get(fold_key(text))
         if hit is not None:
+            if prov is not None:
+                prov.syn[(fr.synonyms, hit, text)] += 1
+                prov.syn_cols.setdefault(fr.synonyms, set()).add(fr.src)
             text = hit
             tr("synonyms", text)
         elif fr.on_unknown != "keep":
@@ -904,6 +927,17 @@ def _apply_derive(cfg: Config, dr: DeriveRule, vals: dict, nums: dict, rowctx: t
     return s
 
 
+def outputs_from(cfg: Config, column: str) -> list[str]:
+    """入力の列 column の値から作られる出力列: その列のルールの出力と、それを使う派生（さらにその先も）。"""
+    outs = [fr.out for fr in cfg.fields if fr.src == column]
+    reach = {column, *outs}
+    for dr in cfg.derives:                       # 派生は宣言順に評価するので、1回なめれば足りる
+        if any(col in reach for col, _ in dr.vars.values()):
+            reach.add(dr.out)
+            outs.append(dr.out)
+    return list(dict.fromkeys(outs))
+
+
 def dedupe_issues(issues: list[Issue]) -> list[Issue]:
     """同じ原因の重複を畳む。match が外れると parts の数だけ同じ C111 が出るため。"""
     seen: set = set()
@@ -949,8 +983,9 @@ def plan_columns(cfg: Config, header: list[str]) -> list[str]:
     return plan
 
 
-def convert_rows(cfg: Config, header: list[str], rows: Iterable[list[str]]
-                 ) -> tuple[list[str], list[list[str]], list[Issue]]:
+def convert_rows(cfg: Config, header: list[str], rows: Iterable[list[str]],
+                 prov: Provenance | None = None) -> tuple[list[str], list[list[str]], list[Issue]]:
+    """変換する。prov を渡すと、訂正・保留のかかったセルと、同義語表で使われた表記を記録する。"""
     uh, _ = uniquify(header)
     idx = {h: i for i, h in enumerate(uh)}
     plan = plan_columns(cfg, uh)
@@ -958,17 +993,48 @@ def convert_rows(cfg: Config, header: list[str], rows: Iterable[list[str]]
     out_rows: list[list[str]] = []
     watch = _rare_shape_columns(cfg) if cfg.rare_shape > 0 else []
     seen_raw: dict[str, list[tuple[int, str, str]]] = {c: [] for c in watch if c in idx}
+    cor = cfg.corrections
+    cor_cols = [c for c in cor.columns if c in idx] if cor else []
     for n, row in enumerate(rows, start=1):
         row = list(row) + [""] * (len(uh) - len(row))
+        nums: dict[str, tuple[Decimal | None, str | None]] = {}
+        key = row[0] if row else ""
+        held: set[str] = set()
+        # 訂正・保留はルールより前。訂正は値を置き換えてからルールにかけ、保留はその列のルールをかけない
+        for c in cor_cols:
+            raw = row[idx[c]]
+            if not raw.strip() or _is_reserved(cfg, raw):
+                continue
+            e = cor.lookup(c, raw, key)
+            if e is None:
+                continue
+            if prov is not None:
+                prov.hits[e.where] += 1
+                prov.keys[n] = key
+            if e.kind == "correct":
+                if prov is not None:
+                    prov.corrected[(n, c)] = (raw, e)
+                row[idx[c]] = e.to
+            else:
+                if prov is not None:
+                    prov.held[(n, c)] = (raw, e)
+                held.add(c)
+                nums[c] = (None, None)       # 派生側は計算しない（ここで報告済み）
+                issues.append(Issue(n, key, c, "C141", "W", f"保留のため変換していません（理由: {e.reason}）", raw))
         vals = {h: row[i] for h, i in idx.items()}
         for c in seen_raw:
             seen_raw[c].append((n, row[0] if row else "", row[idx[c]]))
-        nums: dict[str, tuple[Decimal | None, str | None]] = {}
         ctx = (n, vals.get(uh[0], "") if uh else "")
         for fr in cfg.fields:
-            if fr.src in vals:
-                vals[fr.out] = _apply_field(cfg, fr, vals[fr.src] if fr.out == fr.src
-                                            else row[idx[fr.src]], nums, ctx, issues)
+            if fr.src not in vals:
+                continue
+            if fr.src in held:               # 保留: 元の列は元の値のまま、別名の出力列は空
+                nums[fr.out] = (None, None)
+                if fr.out != fr.src:
+                    vals[fr.out] = ""
+                continue
+            vals[fr.out] = _apply_field(cfg, fr, vals[fr.src] if fr.out == fr.src
+                                        else row[idx[fr.src]], nums, ctx, issues, None, prov)
         for dr in cfg.derives:
             vals[dr.out] = _apply_derive(cfg, dr, vals, nums, ctx, issues)
         out_rows.append([vals.get(c, "") for c in plan])

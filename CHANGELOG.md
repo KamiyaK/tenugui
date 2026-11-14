@@ -3,6 +3,25 @@
 書き方は [Keep a Changelog](https://keepachangelog.com/ja/1.1.0/) に、版番号は [セマンティック バージョニング](https://semver.org/lang/ja/) に沿う。
 1.0.0 までは、設定ファイル（`schema_version = 1`）の既存の書き方の意味は変えない方針。
 
+## [0.11.0] - 2026-11-15
+
+元データの問題を「黙って直さない」ための版。訂正ファイルを置かなければ、今までの設定・出力（CSV・終了コード）は変わらない。
+
+### 追加
+- 訂正ファイル `<ルール名>.corrections.toml`（ルールTOMLと同じ場所にあれば自動で読む。`--corrections` で指定も可）
+  - `[[correct]]` 訂正: 正解が自明な誤記。値を置き換えてからルールにかける。`reason` 必須
+  - `[[hold]]` 保留: 判断が要る値。変換せず元の値のまま通し、`C141`（警告）で報告する。`reason` 必須
+  - `key` で先頭列（シート名など）に絞れる。`ref` に根拠・照会先を書ける
+- 修正依頼リスト `<名>_tenugui_fix.csv`: 訂正・保留のかかったセルを、元の値・訂正後・理由つきで1行ずつ（訂正ファイルを使っているときだけ書く）
+- 当たらなくなった訂正・保留の報告（`L301` / `L302`）: 元データが直ったことが分かる
+- HTML レポート: 表記統一（緑）・訂正（青）・保留（紫）の色分け、「元データの修正依頼リスト」と「用語対応表（この入力で使われた表記）」の節
+- JSON レポート / convert の JSON: `provenance`（件数、修正依頼リスト、当たらなかった訂正・保留、使われた表記）、`changes[].kind`
+- `--fail-on hold`: エラーか、保留の値が残っていれば終了コード 1
+- `tenugui glossary -c R [IN]`: 用語対応表（正式名 ← 別名）を text / JSON / CSV で出す。CSV を渡すと使われた件数つき
+- `tenugui schema` に訂正ファイルの書き方と、どこに書くかの判断基準
+- `tenugui try` の途中経過に `correct` / `hold`、`tenugui check` に訂正ファイルの件数と `L303`（列が入力に無い）
+- `examples/corrections_demo.toml` と `examples/corrections_demo.corrections.toml`
+
 ## [0.10.0] - 2026-11-14
 
 ### 追加

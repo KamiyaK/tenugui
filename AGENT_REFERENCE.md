@@ -1,6 +1,6 @@
 # Tenugui AGENT_REFERENCE（agent向け・機械向けの仕様）
 
-動機や比喩は書かない。人向けは README.md。バージョン 0.6.0 / schema_version = 1。
+動機や比喩は書かない。人向けは README.md。バージョン 0.11.0 / schema_version = 1。
 
 ## 0. 不変条件
 - I1 決定的: 同じ入力・同じ設定なら同じ出力。乱数・時刻・ネットワークを使わない
@@ -10,8 +10,10 @@
 - I5 空セルは空のまま通す（`required = true` のときだけ C201）
 - I6 派生値は、入力が空→空 / NG印→空+W(C302) / 上流で変換失敗→空（二重報告しない）
 - I7 重複列名は `名前#2` `名前#3` に一意化して出力する
+- I8 元データの問題を黙って直さない: 誤記の訂正は訂正ファイルの `[[correct]]`（理由必須）、判断が要る値は `[[hold]]`（変換しない）。どちらも原値・理由つきでレポートに残る。推測で値を決めない
 
 ## 1. 1つの [[field]] の処理順
+（訂正ファイルがあれば最初に: `[[correct]]` に当たる値は置き換えてから下へ / `[[hold]]` に当たる値は下を一切かけない）
 `reserved?` → 空? → NFKC正規化+strip → `sub` → `synonyms` → `match/extract` → `to`(数値+単位パース→換算) → `decimals/trim/unit_out`
 - NFKC: 全角→半角、`㎜`→`mm`、`℃`→`°C`、`～`→`~`、`²`→`2`、`µ`→`μ`。**正規表現はNFKC後の文字に対して書く**（`～` ではなく `[~～]`、`mm²` ではなく `mm2`）
 - 数値より前に文字があるもの(`約85mm`, `φ10`)は C101。`sub` で落とすか `match` で数値部分だけ取り出す
@@ -67,6 +69,37 @@
 - `[[field.case]]`: 1つの `[[field]]`（キーは `src`, `drop_src`, `case` のみ）の下に並べる。各 case は `pattern` | `preset` | `match` のどれか1つ + `parts`。上から順に試し最初の一致を使う。同じ `out` を複数 case で使える。一致した case に無い out は空。全て不一致は C111（1行1件、メッセージに形）。case の parts では `sub` 不可
 - 形 = NFKC後に数値を `#` にした文字列（`330±15mm` → `#±#mm`、桁区切りは残る: `1,200V` → `#,#V`）。**survey / issue_groups / suggest が返す `shape` は、そのまま `pattern` に書ける**
 
+## 2d. 訂正・保留（0.11.0）— ルールTOMLとは別のファイル
+- 場所: ルールTOML `R.toml` と同じフォルダの `R.corrections.toml`（あれば自動で読む。`--corrections PATH` で指定も可）。無ければ今までと同じ動作
+- どこに書くかの判断:
+  | 値の状態 | 書く場所 |
+  |---|---|
+  | 意味が同じ言い換え・単位や書式の違い | ルールTOML（`synonyms` / `pattern` / `case`） |
+  | 誤記で、正しい値が元データだけから言い切れる | `[[correct]]` |
+  | 2通りに読める・設計者に聞かないと決まらない | `[[hold]]`（推測で直さない） |
+  | 値そのものの設計上の誤り | tenugui では直さない（後段のチェッカーの仕事） |
+- 書き方（`schema_version = 1` 必須）:
+  ```toml
+  schema_version = 1
+  [[correct]]
+  column = "outer_dia"          # 入力の列名
+  value = "35nm"                # 元の値。完全一致（全角半角・前後の空白の違いは無視）
+  to = "35mm"                   # 訂正後。この値を通常のルールにかける
+  reason = "外径が nm になることはない"   # 必須
+  key = ["P002"]                # 任意: 先頭列（シート名）で絞る。省略 = 列の全行。key 付きが key なしより優先
+  ref = "照会先・図面番号"        # 任意
+  [[hold]]
+  column = "test_volt"
+  value = "100/200V"
+  reason = "併記か範囲か決められない"     # 必須
+  ```
+- 設定エラーになるもの: `reason` なし / `value` と `to` が同じ / 同じ（列・値・key）が2つ / 訂正後の値が別の訂正・保留の対象 / 抽出NG印を対象にした / 未知のキー
+- `[[correct]]`: 入力のその列の値を置き換えてからルールにかける。ルールのない列にも効く（変換前後チェックは訂正を意図した変更として扱う）。`changes[].kind = "correct"`
+- `[[hold]]`: その列のルールをかけない。元の列は元の値のまま、別名の出力列（`out` ≠ `src`）と、その値を使う派生は空。`C141`(W) を1件報告。派生側は二重に報告しない
+- 空セルと抽出NG印には当たらない
+- 一度も当たらなかった訂正・保留は `provenance.unused[]`（`L301` 訂正 / `L302` 保留）。元データが直ったなら消す。列名の書き間違いは `column_missing: true`。フォルダ一括では、全ファイルで当たらなかったものだけを `unused[]`（トップレベル）に出す
+- `[[test]]` と `try` にも効く（try の trace の stage は `correct` / `hold`）
+
 ## 2c. `[[test]]`（0.7.0）
 - `in = { 列 = "値" }`（必須）, `out = { 出力列 = "期待値" }`, `codes = ["C111"]`（期待する報告コードの集合。省略時は空=問題なしを期待）, `name`（任意）。`out` か `codes` のどちらかは必須
 - `check` が毎回実行し、失敗はエラー扱い（終了コード1）。ルールを変えたら必ず `check`
@@ -76,7 +109,7 @@
 
 ## 3b. 出力ファイル（convert）
 既定の出力先 = 入力CSVのあるフォルダの `tenugui_out/`（無ければ作成）。`--out-dir` で変更、`-o` で出力CSV名、`--timestamp` で `_YYYYmmdd_HHMMSS` 付き。
-出力は3つ: `<名>_tenugui.csv`（変換結果）/ `<名>_tenugui.html`（人が見るレポート。1ページ・単体で開ける。問題セルに色）/ `<名>_tenugui.json`（機械が読むレポート `tenugui.report/1`: version, time, command, input, config, config_sha, header_sha, rows, counts, files, issue_groups[], case_coverage[], issues[]（全件・raw つき）, changes[{row,key,column,before,after}], verification, not_idempotent[], lint[], header_drift）。**後から結果を調べるときは JSON を読む**。`--detail-files` で従来の `_conv.csv`（問題一覧）`_diff.csv`（変更セル。`--no-diff` で省略）`.log` も書く
+出力は3つ: `<名>_tenugui.csv`（変換結果）/ `<名>_tenugui.html`（人が見るレポート。1ページ・単体で開ける。問題セルに色）/ `<名>_tenugui.json`（機械が読むレポート `tenugui.report/1`: version, time, command, input, config, config_sha, header_sha, rows, counts, files, issue_groups[], case_coverage[], issues[]（全件・raw つき）, changes[{row,key,column,before,after}], verification, not_idempotent[], lint[], header_drift）。**後から結果を調べるときは JSON を読む**。訂正ファイルを使っているときだけ `<名>_tenugui_fix.csv`（元データの修正依頼リスト。列: 種類, row, key, column, 元の値, 訂正後, 理由, 根拠。当たりが無ければ見出しだけ）も書く。JSON レポートと convert の JSON には `provenance:{corrections_file, corrections_sha, counts:{normalize, correct, hold}, fix_requests[{kind, where, column, value, to, reason, ref, count, keys[], rows[], keys_truncated}], cells[{kind, row, key, column, before, after, reason, ref, outputs[]}]（訂正・保留のかかったセル全件。`outputs` はその値から作られる出力列。**後段のツールは kind = hold の行の column と outputs を未検査として扱う**）, unused[{code, kind, where, column, value, to, key[], reason, column_missing, message}], glossary[{set, canonical, total, unified, variants[{value, count, canonical}], columns[]}]}` が入る（訂正ファイルが無くても `counts.normalize` と `glossary` は入る）。`changes[]` の各要素に `kind`（`normalize` | `correct`）。HTML は 表記統一=緑 / 訂正=青 / 保留=紫 で色分けし、修正依頼リストと用語対応表（この入力で使われた表記と件数）の節が付く。`--detail-files` で従来の `_conv.csv`（問題一覧）`_diff.csv`（変更セル。`--no-diff` で省略）`.log` も書く
 
 ## 3b2. 元の列の削除 `drop_src`
 `drop_src = true`（field / preset / match の行）で、元の列を出力から消す。`out = src`（元の列への置換）との併用は設定エラー。消した列は verification.dropped_columns:[{column, failed_rows}] に出る（意図した削除なので違反にはならない）。失敗行の元の値は *_conv.csv の raw とログに残る。派生の vars は消した列も参照できる
@@ -99,6 +132,7 @@ JSON: `convert` の `verification:{ok,summary,violations[]}`、`verify` は `{sc
 | C111 | E | match/extract 不一致 | `try` で正規表現を試す（NFKC後の文字で書く） |
 | C121 | W/E | 同義語表に無い | [synonyms.*] に追加（on_unknown=error のとき E） |
 | C131 | W | 変換はできたが、その列では少数派の形（単位なし・桁区切り `1,200`・書き方違い）。値のある行が20以上の、数値として読む通常の field と preset が対象（pattern / match / case は対象外） | 正しければ放置可。別の書式なら case を足す。無効化は `[settings] rare_shape = 0`（既定 0.05 = 5%以下） |
+| C141 | W | 保留（訂正ファイルの `[[hold]]`）。変換せず元の値のまま通した | 判断がついたら `[[hold]]` を消し、誤記なら `[[correct]]`、正しい値ならルールを足す。残っていたら止めたいときは `--fail-on hold` |
 | C201 | E | 必須が空 | 入力の欠落、または match の該当部分なし |
 | C301 | E | 派生の入力が数値として読めない | 上流 field で数値化 |
 | C302 | W | 派生の入力がNG印 | 情報のみ |
@@ -110,8 +144,12 @@ JSON: `convert` の `verification:{ok,summary,violations[]}`、`verify` は `{sc
 | L102 | W | `--verify`/`--idempotent` で再実行すると値が変わる列 | 設定を直す |
 | L201 | W(lint) | 未使用の同義語表 | 削除または field から参照 |
 | C003 | W | lock と列構成が違う（増/減） | 意図した変更なら `tenugui lock` で再記録 |
+| L301 | W | 当たらなかった訂正 | 元データが直ったなら `[[correct]]` を消す。違うなら column / value の綴りを確認 |
+| L302 | W | 当たらなかった保留 | 同上 |
+| L303 | W(check) | 訂正・保留の列が入力に無い | column を直す |
 
 ## 5. CLI と JSON（`--format json` は stdout に1行のJSON）
+`--fail-on` は none | error | hold | warn。`hold` = エラーがあるか、保留（C141）が1つでも残っていれば終了コード1（自動化に流す前の関門に使う）。`-c` を取るコマンドは `--corrections PATH` も取る。
 終了コード: 0 OK / 1 `--fail-on` 基準に該当 / 2 設定・使い方のエラー（JSON時も `{"schema":"tenugui.error/1","ok":false,"config_errors":[{where,message}]}` を stdout に出す）
 - `tenugui check -c R [IN] [--idempotent] [--format json] [--fail-on error|warn|none(既定error)]` → `{schema:"tenugui.check/1", ok, fields, derives, input_problems[], lint[], duplicate_columns[], header_drift, not_idempotent[]}`
 - `tenugui convert IN -c R [-o OUT] [--out-dir D] [--timestamp] [--detail-files [--no-diff]] [--verify] [--max-issues N] [--format json] [--fail-on ...(既定none)]` → OUT.csv / OUT.html / OUT.json（`--detail-files` で OUT_conv.csv(row,key,column,code,severity,message,raw,out), OUT_diff.csv(row,key,column,before,after), OUT.log）。JSON: `{schema:"tenugui.convert/1", ok, rows, counts:{error,warning}, files{output,html,json}, issues[{row,key,column,out,code,severity,message,raw,hint}], issues_truncated, changed_cells, not_idempotent[], lint[], header:{sha,duplicates,drift}}`
@@ -129,6 +167,7 @@ JSON: `convert` の `verification:{ok,summary,violations[]}`、`verify` は `{sc
 - `tenugui --version`（`-V`）→ `tenugui 0.10.0`
 - `tenugui schema [--format json]` → `{schema:"tenugui.schema/1", version, schema_version, toml:{settings, units, unit_alias, synonyms, field:{forms:{plain,split,case}, value_keys, part_only_keys, order}, derive, test}, presets{名前:{parts[]}}, preset_examples, codes{コード:{severity, meaning, hint}}, notes[]}`。各キーは `{type, desc, default?, required?, requires?, conflicts?}`
 - `tenugui convert フォルダ|IN1 IN2 ... -c R --format json` → `{schema:"tenugui.batch/1", ok, totals:{files, failed, rows, error, warning}, results:[convert と同じ辞書...]}`。フォルダは中の `*.csv`（サブフォルダは見ない）。列が足りないファイルは `results[].input_problems` に入り、残りは続行。終了コードは最も悪いもの。`-o` は使えない
+- `tenugui glossary -c R [IN] [--format text|json|csv]` → 用語対応表（同義語表を「正式名 ← 別名」にしたもの。配布用）。`{schema:"tenugui.glossary/1", rows, terms:[{set, canonical, variants[], columns[], count?, unified?, used?[{value,count}]}]}`。IN を渡すと、実際に使われた件数（count = 全体、unified = 正式名と違う表記の件数）が付く
 - `tenugui lock IN -c R` → R.lock.json に列構成を記録。以後 check/convert が列の増減を C003 で報告
 
 ## 6. 推奨ループ（agent）
@@ -138,11 +177,12 @@ JSON: `convert` の `verification:{ok,summary,violations[]}`、`verify` は `{sc
 3. 代表的な値を `[[test]]` にする（`try ... --as-test` の出力を、値を確認してから貼る）
 4. `check -c R IN --format json --idempotent` → `config_errors` / `input_problems` / `lint` / `tests.failures` を直す
 5. `convert IN -c R --verify --format json --max-issues 0` → `issue_groups` を見る
+5b. ルールで直せない値は 2d の表で振り分ける: 自明な誤記 → `[[correct]]`、判断が要る → `[[hold]]`。**理由は「なぜそう言えるか」を元データの事実で書く**（人が修正依頼として読む）。迷ったら必ず `[[hold]]`
 6. 問題が残れば `suggest IN -c R --format json` → `suggestion.toml` を、`note` を読み意味を確認してから設定に入れる → 4 に戻る
 7. 既存の設定を直したときは `impact IN -c 新R --base 旧R --format json` で、意図した列・行だけが変わったか確認する
 8. 難しい値は `try --field 列 値 --format json` で `trace` を見る（case 形式は最初の stage が `case`）
 9. 本番の列構成が固まったら `lock`
-10. 完了条件: `counts.error == 0`（残すと決めた問題を除く）、`tests.failed == 0`、`verification.ok`、`not_idempotent == []`、`header.drift` が null か changed=false
+10. 完了条件: `provenance.unused == []`、保留は人が判断するまで残してよい（`provenance.counts.hold` を報告する）、`counts.error == 0`（残すと決めた問題を除く）、`tests.failed == 0`、`verification.ok`、`not_idempotent == []`、`header.drift` が null か changed=false
 
 ## 6b. 「A,B,CならA」
 - 値の統一（B・C も A）: `[synonyms.g]` に `"A" = ["B", "C"]`、field に `synonyms = "g"`。突合は完全一致（NFKC・大小無視・空白と `-_・` を除去）。部分一致はしない。表に無い値は `on_unknown`（warn/keep/error）
@@ -158,4 +198,5 @@ JSON: `convert` の `verification:{ok,summary,violations[]}`、`verify` は `{sc
 - TOML 1.0 はインラインテーブル内の改行不可。`parts = { ... }` は1行で書く（長ければ `[field.parts.x]` サブテーブル形式でも可）
 - `[synonyms.x]` を作ったら field から `synonyms = "x"` で参照する（未参照は L201）
 - 数字だけ違う値（型番・番号・寸法）は同義語として束ねない（draft/survey も束ねない）
-- 実データ由来の列名・値・型式名は共有物（README・examples・テスト）に入れない
+- 実データ由来の列名・値・型式名は共有物（README・examples・テスト）に入れない。**訂正ファイルと同義語表の実物は社内の語彙そのもの**なので、公開リポジトリには置かない
+- 表記ゆれを `[[correct]]` に書かない（用語対応表に載らず、修正依頼リストが膨らむ）。逆に、誤記を `synonyms` の別名として書かない（誤記が「正しい別名」として配られてしまう）
