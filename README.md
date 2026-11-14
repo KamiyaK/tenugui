@@ -17,6 +17,7 @@ tenugui ui                                        # 簡易UI
 tenugui convert in.csv -c rules.toml              # in.csv のあるフォルダの tenugui_out/ に 結果CSV・HTMLレポート・JSONレポート
 tenugui verify  in.csv out.csv -c rules.toml      # 変換前後の突き合わせ検証
 tenugui schema                                    # 設定の書き方（キー・型・preset・報告コード）
+tenugui glossary -c rules.toml [in.csv]           # 用語対応表（正式名 ← 別名）。CSVを渡すと使われた件数つき
 ```
 
 ## 処理順（1つの [[field]]）
@@ -38,6 +39,42 @@ tenugui schema                                    # 設定の書き方（キー�
 式で使えるもの: 数値, 変数, `+ - * / **`(整数指数), 括弧, `pi`, `abs min max round sqrt`。
 
 変更履歴は [CHANGELOG.md](CHANGELOG.md)。版は `tenugui --version` で確認できる。
+
+## 0.11.0 の追加（元データの問題を黙って直さない）
+
+ルールTOML には「意味を変えない言い換え」（表記ゆれ・単位）だけを書く。元データそのものの問題は、
+別のファイル `<ルール名>.corrections.toml` に **理由つきで** 書く。このファイルを置かなければ、今までと何も変わらない。
+
+| 値の状態 | 書く場所 | 変換 | レポートの色 |
+|---|---|---|---|
+| 意味が同じ言い換え・単位や書式の違い | ルールTOML（`synonyms` など） | する | 緑（表記統一） |
+| 誤記で、正しい値が言い切れる | `[[correct]]` | 直してから変換する | 青（訂正） |
+| 2通りに読める・聞かないと決まらない | `[[hold]]` | しない（元の値のまま） | 紫（保留） |
+| 値そのものの設計上の誤り | 書かない（tenugui では直さない） | — | — |
+
+```toml
+# rules.corrections.toml（rules.toml と同じ場所に置くと自動で読む）
+schema_version = 1
+
+[[correct]]
+column = "outer_dia"
+value = "35nm"
+to = "35mm"
+reason = "外径が nm になることはない。同じ形の他のシートはすべて 35mm"   # 必須
+
+[[hold]]
+column = "test_volt"
+value = "100/200V"
+reason = "100V と 200V の併記か、100〜200V の範囲か、この値だけでは決められない"   # 必須
+ref = "設計担当に照会中"          # 任意
+# key = ["P003"]                 # 任意: 先頭列（シート名）で絞る
+```
+
+- **修正依頼リスト** `<名>_tenugui_fix.csv`: 訂正・保留のかかったセルを、元の値・訂正後・理由つきで1行ずつ。元データを直す人にそのまま渡せる。同じ内容が HTML レポートにも出る
+- **元データが直ると分かる**: 当たらなくなった訂正・保留を `L301` / `L302` で知らせる（消してよい）
+- **保留が残っていたら止める**: `tenugui convert ... --fail-on hold`（自動化に流す前の関門。見るだけなら付けない）
+- **用語対応表**: `tenugui glossary -c rules.toml --format csv > glossary.csv`（同義語表を「正式名 ← 別名」にしたもの）。HTML レポートには、その入力で実際に使われた表記と件数が出る
+- 動く例: `examples/corrections_demo.toml`
 
 ## 0.10.0 の追加
 - **UI**: 「形」タブ、「内訳と修正案」タブ、「レポートを開く」ボタン。「検証」は `[[test]]` も実行する
