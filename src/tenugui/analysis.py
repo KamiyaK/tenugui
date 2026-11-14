@@ -11,6 +11,7 @@ from pathlib import Path
 
 from .core import (Config, FieldRule, Issue, _apply_field, _is_reserved, check_header, compile_pattern, is_null,
                    convert_rows, select_case, shape_of, survey as _survey, uniquify)
+from .corrections import KIND_LABEL, Provenance, fix_cells, summarize, unused_entries
 from .units import UnitError, UnitTable, fold_key, normalize_text, parse_quantity
 
 # ---------------------------------------------------------------- 修正のヒント
@@ -25,6 +26,8 @@ HINTS = {
     "C131": "変換はできたが形が少数派（単位なし・桁区切り・書き方違いなど）。正しければそのままでよい。"
             "別の書式なら case を足す。警告が不要なら [settings] rare_shape = 0",
     "C121": "同義語表に無い値。[synonyms.*] に追加するか on_unknown を見直す（survey の candidates 参照）",
+    "C141": "訂正ファイルの [[hold]]（保留）に当たった値。変換せず元の値のまま通している。"
+            "判断がついたら [[hold]] を消し、誤記なら [[correct]] に、正しい値ならルールを足す",
     "C201": "必須項目が空。入力データの欠落か、match の該当部分が無い",
     "C301": "派生の入力が数値として読めない。上流の field で数値化する",
     "C302": "入力がchozuの抽出NG印のため計算しない（情報）",
@@ -512,11 +515,20 @@ def try_row(cfg: Config, values: dict[str, str]) -> dict:
         else:
             skipped_d.append(d.out)
     sub = replace(cfg, fields=kept_f, derives=kept_d)
-    cols, rows, issues = convert_rows(sub, header, [[values[h] for h in header]])
+    prov = Provenance()
+    cols, rows, issues = convert_rows(sub, header, [[values[h] for h in header]], prov)
     traces = {}
     for f in kept_f:
         t: list = []
-        _apply_field(cfg, f, values[f.src], {}, (1, ""), [], trace=t)
+        raw = values[f.src]
+        if (1, f.src) in prov.held:
+            t.append(("hold", f"保留（{prov.held[(1, f.src)][1].reason}）"))
+        else:
+            if (1, f.src) in prov.corrected:
+                e = prov.corrected[(1, f.src)][1]
+                t.append(("correct", f"{raw} → {e.to}（{e.reason}）"))
+                raw = e.to
+            _apply_field(cfg, f, raw, {}, (1, ""), [], trace=t)
         traces[f.out] = [{"stage": a, "value": b} for a, b in t]
     return {"outputs": dict(zip(cols, rows[0])), "issues": [issue_dict(i) for i in issues],
             "trace": traces, "skipped_fields": [f.out for f in cfg.fields if f.src not in values],
@@ -526,12 +538,13 @@ def try_row(cfg: Config, values: dict[str, str]) -> dict:
 # ---------------------------------------------------------------- 変換前後チェック
 def verify_before_after(cfg: Config, header: list[str], rows: list[list[str]],
                         out_header: list[str], out_rows: list[list[str]],
-                        issues: list[Issue]) -> dict:
+                        issues: list[Issue], corrected: set | None = None) -> dict:
     """変換の前後を突き合わせて「意図しない変化」を探す。
 
     violations（あってはならない）:
       row_count        行数が変わった
       untouched_changed ルール対象外の列（変換しない列・out違いの元列）の値が変わった
+                       （corrected = 訂正ファイルで訂正した (行, 列) は意図した変更なので除く）
       ng_altered       chozuの抽出NG印が変わった
       column_missing   入力列が出力から消えた（drop_src / passthrough=false で意図したものを除く）
     warnings:
@@ -541,6 +554,7 @@ def verify_before_after(cfg: Config, header: list[str], rows: list[list[str]],
     iidx = {h: i for i, h in enumerate(uh)}
     oidx = {h: i for i, h in enumerate(out_header)}
     replaced = {f.src for f in cfg.fields if f.out == f.src}
+    corrected = corrected or set()
     dropped = {f.src for f in cfg.fields if f.drop_src}
     derived_or_new = {f.out for f in cfg.fields if f.out != f.src} | {d.out for d in cfg.derives}
     err_cells: Counter = Counter()
@@ -571,7 +585,7 @@ def verify_before_after(cfg: Config, header: list[str], rows: list[list[str]],
             st["changed"] += 1
             if _is_reserved(cfg, before):
                 violations.append({"kind": "ng_altered", "column": c, "row": n, "before": before, "after": after})
-            elif c not in replaced:
+            elif c not in replaced and (n, c) not in corrected:
                 violations.append({"kind": "untouched_changed", "column": c, "row": n,
                                    "before": before, "after": after})
             if before.strip() and not after.strip() and not is_null(cfg, before):   # null_values は意図した空
@@ -620,6 +634,13 @@ def write_log(path: str | Path, info: dict) -> None:
         L.append(f"削除した元の列: {d['column']}"
                  + (f"（変換に失敗した行 {d['failed_rows']} 件。元の値はレポートの問題一覧 raw に記録）"
                     if d["failed_rows"] else ""))
+    pv = info.get("provenance")
+    if pv and pv["corrections_file"]:
+        L += ["", f"[訂正・保留] {pv['corrections_file']}  (sha256-12: {pv['corrections_sha']})  "
+                  f"訂正 {pv['counts']['correct']} セル / 保留 {pv['counts']['hold']} セル"]
+        L += [f"  {KIND_LABEL[g['kind']]} {g['column']}: {g['value']!r}" + (f" → {g['to']!r}" if g["to"] else "")
+              + f"  {g['count']} 件  理由: {g['reason']}" for g in pv["fix_requests"]]
+        L += [f"  注意 {u['code']} {u['where']}: {u['message']}" for u in pv["unused"]]
     for b in info.get("not_idempotent", []):
         L.append(f"注意 L102 再実行で値が変わる列 {b['column']}: {b['first']!r} → {b['second']!r}")
     for w in info.get("lint", []):
@@ -645,8 +666,9 @@ def verify_files(cfg: Config, header: list[str], rows: list[list[str]], out_path
     出力が古い・手で編集された場合は output_differs を報告する。"""
     from .core import read_csv
     oh, orows = read_csv(out_path, cfg.encoding_out)
-    ph, prows, issues = convert_rows(cfg, header, rows)
-    v = verify_before_after(cfg, header, rows, oh, orows, issues)
+    prov = Provenance()
+    ph, prows, issues = convert_rows(cfg, header, rows, prov)
+    v = verify_before_after(cfg, header, rows, oh, orows, issues, set(prov.corrected))
     diff = None
     if oh != ph:
         diff = {"column": "(ヘッダ)", "row": 0, "before": ",".join(ph)[:60], "after": ",".join(oh)[:60]}
@@ -673,23 +695,44 @@ def _write_diff(path: Path, changes: list[dict], enc: str) -> None:
             w.writerow([c["row"], c["key"], c["column"], c["before"], c["after"]])
 
 
+def _write_fix(path: Path, cells: list[dict], enc: str) -> None:
+    """元データの修正依頼リスト: 訂正・保留のかかったセルを1行ずつ。"""
+    import csv
+    with open(path, "w", newline="", encoding=enc) as f:
+        w = csv.writer(f)
+        w.writerow(["種類", "row", "key", "column", "元の値", "訂正後", "理由", "根拠"])
+        for c in cells:
+            w.writerow([KIND_LABEL[c["kind"]], c["row"], c["key"], c["column"], c["before"], c["after"],
+                        c["reason"], c["ref"]])
+
+
 def convert_to_files(cfg: Config, config_path: str, input_path: str, header: list[str],
                      rows: list[list[str]], out: Path, *, no_diff: bool = False,
-                     verify: bool = False, command: str = "", detail_files: bool = False) -> dict:
+                     verify: bool = False, command: str = "", detail_files: bool = False,
+                     report_unused: bool = True) -> dict:
     """変換して、出力CSV・HTMLレポート（人が見る）・JSONレポート（機械が読む）を out と同じフォルダに書く。
-    detail_files=True で、従来の 変換レポートCSV・差分CSV・ログ も書く。印字はしない。"""
+    訂正ファイルを使っているときだけ、修正依頼リスト <名>_fix.csv も書く。
+    detail_files=True で、従来の 変換レポートCSV・差分CSV・ログ も書く。印字はしない。
+    report_unused=False は、複数ファイルの一括変換用（当たらなかった訂正・保留は全ファイルを見てから判断する）。"""
     from . import __version__
     from .core import write_csv, write_report
     from .report import build_report, render_html, write_json
     uh, dups = uniquify(header)
     drift = header_drift(config_path, header) if config_path else None
-    out_header, out_rows, issues = convert_rows(cfg, header, rows)
+    prov = Provenance()
+    out_header, out_rows, issues = convert_rows(cfg, header, rows, prov)
     out.parent.mkdir(parents=True, exist_ok=True)
     write_csv(out, out_header, out_rows, cfg.encoding_out)
     htmlp, jsonp = out.with_suffix(".html"), out.with_suffix(".json")
     files = {"output": str(out), "html": str(htmlp), "json": str(jsonp)}
     changes = diff_changes(header, rows, out_header, out_rows)
-    ver = verify_before_after(cfg, header, rows, out_header, out_rows, issues)
+    pv = summarize(cfg.corrections, prov, changes, uh, report_unused)
+    cells = fix_cells(prov)
+    fixp = out.with_name(out.stem + "_fix.csv")
+    if cfg.corrections is not None:     # 訂正ファイルを使っているときだけ書く（当たりが無ければ見出しだけ）
+        _write_fix(fixp, cells, cfg.encoding_out)
+        files["fix"] = str(fixp)
+    ver = verify_before_after(cfg, header, rows, out_header, out_rows, issues, set(prov.corrected))
     idem = idempotency_report(cfg, header, rows) if verify else []
     idicts = [issue_dict(i) for i in issues]
     e = sum(1 for i in issues if i.severity == "E")
@@ -710,15 +753,16 @@ def convert_to_files(cfg: Config, config_path: str, input_path: str, header: lis
                                  "config_sha": sha, "header_sha": header_sha(uh), "rows": len(out_rows),
                                  "errors": e, "warnings": len(issues) - e, "files": files, "verification": ver,
                                  "not_idempotent": idem, "lint": lint(cfg), "drift": drift, "issues": idicts,
-                                 "groups": groups, "coverage": cover})
+                                 "groups": groups, "coverage": cover, "provenance": pv})
     report = build_report(version=__version__, command=command, input_path=input_path,
                           config_path=config_path or "(設定なし)", config_sha=sha, header_sha=header_sha(uh),
                           rows=len(out_rows), errors=e, warnings=len(issues) - e, files=files, groups=groups,
                           coverage=cover, issues=idicts, changes=changes, verification=ver,
-                          not_idempotent=idem, lint=lint(cfg), drift=drift)
+                          not_idempotent=idem, lint=lint(cfg), drift=drift, provenance=pv)
     write_json(jsonp, report)
-    htmlp.write_text(render_html(report, cfg, header, rows, out_header, out_rows, issues), encoding="utf-8")
+    htmlp.write_text(render_html(report, cfg, header, rows, out_header, out_rows, issues, prov), encoding="utf-8")
     return {"out_header": out_header, "out_rows": out_rows, "issues": issues, "idicts": idicts,
             "changes": changes, "verification": ver, "not_idempotent": idem, "drift": drift,
             "files": files, "errors": e, "warnings": len(issues) - e, "duplicates": dups,
-            "header_sha": header_sha(uh), "groups": groups, "coverage": cover}
+            "header_sha": header_sha(uh), "groups": groups, "coverage": cover, "provenance": pv,
+            "unused": unused_entries(cfg.corrections, prov, uh)}
