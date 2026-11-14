@@ -16,6 +16,7 @@ tenugui try     -c rules.toml --field 列 値        # CSVなしで1つの値を
 tenugui ui                                        # 簡易UI
 tenugui convert in.csv -c rules.toml              # in.csv のあるフォルダの tenugui_out/ に 結果CSV・HTMLレポート・JSONレポート
 tenugui verify  in.csv out.csv -c rules.toml      # 変換前後の突き合わせ検証
+tenugui schema                                    # 設定の書き方（キー・型・preset・報告コード）
 ```
 
 ## 処理順（1つの [[field]]）
@@ -37,6 +38,37 @@ tenugui verify  in.csv out.csv -c rules.toml      # 変換前後の突き合わ�
 式で使えるもの: 数値, 変数, `+ - * / **`(整数指数), 括弧, `pi`, `abs min max round sqrt`。
 
 変更履歴は [CHANGELOG.md](CHANGELOG.md)。版は `tenugui --version` で確認できる。
+
+## 0.9.0 の追加（書く量を減らす）
+
+**列のまとめ指定** — 同じルールを複数の列にかける。
+
+```toml
+[[field]]
+src = ["strip_l", "strip_r"]             # 配列で並べる
+number_only = true
+strip_units = ["mm"]
+
+[[field]]
+for = { n = ["0", "1"] }                 # 組み合わせの数だけ展開。src と out の {n} を置き換える
+src = "wire{n}_length"
+preset = "tolerance"
+drop_src = true
+each = { number_only = true, strip_units = ["mm"] }               # 全部の部品に共通の指定
+parts = { nom = "wire{n}_len_nom", tol = "wire{n}_len_tol" }      # 部品名 = "出力列名" の短縮形
+```
+
+- `for` は複数の名前を書ける（`for = { n = ["0", "1"], side = ["l", "r"] }` は4列）。`out` には `{src}`（元の列名）も書ける
+- `each` は `parts` の全部品に共通の指定。部品側に同じキーがあれば部品が優先。`[[field.case]]` では field に書くと全 case に、case に書くとその case に効く
+- `parts` の値は、出力列名だけなら文字列で書ける
+
+**空として扱う値** — `[settings] null_values = ["-", "なし", "未定"]`。ルールのかかった列で、これらの値を空と同じに扱う（全角半角・大小は無視、完全一致）。ルールのない列は変えない。
+
+**フォルダ一括** — `tenugui convert フォルダ -c rules.toml` で、中の `*.csv` を全部変換する。ファイルを複数並べてもよい。最後に合計を出す。
+
+**設定の書き方を出す** — `tenugui schema`（agent 向けは `--format json`）。キー・型・既定値・併用できないキー・preset の部品名・報告コードの一覧。
+
+**エラーメッセージ** — 綴り間違いに候補を出す（キー、列名、単位、preset、同義語表の名前）。TOML の構文エラーには、よくある原因を添える。
 
 ## 0.8.0 の追加
 

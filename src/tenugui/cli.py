@@ -1,4 +1,4 @@
-"""コマンドライン: convert / check / survey / draft / try / test / suggest / impact / compare / verify / lock / ui
+"""コマンドライン: convert / check / survey / draft / try / test / suggest / impact / compare / verify / schema / lock / ui
 
 人向けは既定のテキスト、agent向けは --format json（スキーマ名 tenugui.*/1）。
 終了コード: 0=OK  1=--fail-on の基準に該当  2=設定・使い方のエラー
@@ -87,13 +87,14 @@ def _print_failures(tests: dict) -> None:
             print(f"     {d['column']}: 期待 {d['expected']!r} / 実際 {d['actual']!r}")
 
 
-def _print_groups(groups: list[dict], limit: int = 10) -> None:
-    for g in groups[:limit]:
-        print(f"  {g['count']:5d} 件  {g['code']} {g['column']}"
-              + (f" → {g['out']}" if g["out"] and g["out"] != g["column"] else "")
-              + (f"  形 {g['shape']}" if g["shape"] else "") + (f"  例 {g['examples']}" if g["examples"] else ""))
+def _group_lines(groups: list[dict], limit: int = 10) -> list[str]:
+    L = [f"  {g['count']:5d} 件  {g['code']} {g['column']}"
+         + (f" → {g['out']}" if g["out"] and g["out"] != g["column"] else "")
+         + (f"  形 {g['shape']}" if g["shape"] else "") + (f"  例 {g['examples']}" if g["examples"] else "")
+         for g in groups[:limit]]
     if len(groups) > limit:
-        print(f"  …ほか {len(groups) - limit} グループ")
+        L.append(f"  …ほか {len(groups) - limit} グループ")
+    return L
 
 
 # ---------------------------------------------------------------- convert
@@ -119,65 +120,101 @@ def resolve_output(input_path: str, output: str | None, out_dir: str | None, sta
     return out
 
 
-def cmd_convert(args) -> int:
-    cfg = load_config(args.config)
-    header, rows = read_csv(args.input, cfg.encoding_in)
+def _inputs(args) -> list[str]:
+    """convert の入力。フォルダを渡すと、その中の *.csv（tenugui_out は除く）。"""
+    res: list[str] = []
+    for a in args.input:
+        pa = Path(a)
+        if pa.is_dir():
+            res += [str(x) for x in sorted(pa.glob("*.csv"))]
+        else:
+            res.append(a)
+    if not res:
+        raise ConfigError([f"入力CSVがありません: {', '.join(args.input)}"])
+    return res
+
+
+def _convert_one(args, cfg, input_path: str) -> tuple[int, dict, list[str]]:
+    """1ファイルを変換。戻り値 (終了コード, JSON用の辞書, 人向けの表示行)。"""
+    header, rows = read_csv(input_path, cfg.encoding_in)
     uh, dups = uniquify(header)
     probs = check_header(cfg, uh)
     if probs:
-        if args.format == "json":
-            _json({"schema": SCHEMA.format("convert"), "ok": False, "input_problems": probs})
-        else:
-            for p in probs:
-                print(f"NG {p}", file=sys.stderr)
-        return 2
-    out = resolve_output(args.input, args.output, args.out_dir, args.timestamp)
-    r = convert_to_files(cfg, args.config, args.input, header, rows, out, no_diff=args.no_diff,
+        return 2, {"schema": SCHEMA.format("convert"), "ok": False, "input": input_path,
+                   "input_problems": probs}, [f"NG {x}" for x in probs]
+    out = resolve_output(input_path, args.output, args.out_dir, args.timestamp)
+    r = convert_to_files(cfg, args.config, input_path, header, rows, out, no_diff=args.no_diff,
                          verify=args.verify, command="tenugui " + " ".join(sys.argv[1:]),
                          detail_files=args.detail_files)
-    out_rows, issues, changes, ver, idem = r["out_rows"], r["issues"], r["changes"], r["verification"], r["not_idempotent"]
+    out_rows, changes, ver, idem = r["out_rows"], r["changes"], r["verification"], r["not_idempotent"]
     drift, files = r["drift"], r["files"]
     e, w = r["errors"], r["warnings"]
     nviol = len(ver["violations"])
     nwarn = w + len(idem) + (1 if drift and drift["changed"] else 0)
     bad = _failing("error" if args.strict and args.fail_on == "none" else args.fail_on, e + nviol, nwarn)
-    idicts = r["idicts"]
-    groups, cover = r["groups"], r["coverage"]
+    idicts, groups, cover = r["idicts"], r["groups"], r["coverage"]
+    shown = idicts if args.max_issues < 0 else idicts[:args.max_issues]
+    j = {"schema": SCHEMA.format("convert"), "ok": not bad, "input": input_path, "rows": len(out_rows),
+         "counts": {"error": e, "warning": w}, "files": files,
+         "issue_groups": groups, "case_coverage": cover,
+         "issues": shown, "issues_truncated": len(shown) < len(idicts),
+         "changed_cells": len(changes),
+         "verification": {"ok": ver["ok"], "summary": ver["summary"], "violations": ver["violations"][:50]},
+         "not_idempotent": idem, "lint": lint(cfg),
+         "header": {"sha": r["header_sha"], "duplicates": dups, "drift": drift}}
+    L = [f"注意: 列名 {d!r} が重複していたため #2, #3... を付けました" for d in dups]
+    L += [f"{len(out_rows)} 行を変換 → {files['output']}", f"エラー {e} 件 / 警告 {w} 件"]
+    L += _group_lines(groups)
+    L += [f"  書式の内訳 {c['column']}: " + " / ".join(f"{x['label']} {x['count']}件" for x in c["cases"])
+          + f" / 不一致 {c['unmatched']}件" for c in cover]
+    s = ver["summary"]
+    L += [f"値が変わったセル {len(changes)} 件",
+          f"変換前後チェック: {'OK' if ver['ok'] else 'NG'}（違反 {s['violations']} / 欠落 {s['lost_cells']}）",
+          f"レポート → {files['html']}（機械用: {Path(files['json']).name}）"]
+    L += [f"  {k} → {files[k]}" for k in ("report", "diff", "log") if k in files]
+    L += [f"  違反 {v['kind']} {v['column']} {v['row']}行: {v['before']!r} → {v['after']!r}" for v in ver["violations"][:5]]
+    L += [f"注意 L102 再実行で値が変わる列 {b['column']}: {b['first']!r} → {b['second']!r}" for b in idem]
+    if drift and drift["changed"]:
+        L.append(f"注意 C003 前回(lock)から列が変わっています 増:{drift['added']} 減:{drift['removed']}")
+    return (1 if bad else 0), j, L
+
+
+def cmd_convert(args) -> int:
+    cfg = load_config(args.config)
+    inputs = _inputs(args)
+    if len(inputs) == 1:
+        code, j, lines = _convert_one(args, cfg, inputs[0])
+        if args.format == "json":
+            _json(j)
+        else:
+            for x in lines:
+                print(x, file=sys.stderr if code == 2 else sys.stdout)
+        return code
+    if args.output:
+        raise ConfigError(["-o は入力が1つのときだけ使えます（複数のときは --out-dir か既定の tenugui_out/）"])
+    results, worst = [], 0
+    for inp in inputs:
+        try:
+            code, j, lines = _convert_one(args, cfg, inp)
+        except (ConfigError, OSError, UnicodeError) as ex:
+            code, j, lines = 2, {"schema": SCHEMA.format("convert"), "ok": False, "input": inp,
+                                 "input_problems": [str(ex)]}, [f"NG {ex}"]
+        results.append(j)
+        worst = max(worst, code)
+        if args.format != "json":
+            print(f"== {inp}")
+            for x in lines:
+                print("  " + x)
+    tot = {"files": len(results), "failed": sum(1 for r in results if "input_problems" in r),
+           "rows": sum(r.get("rows", 0) for r in results),
+           "error": sum(r.get("counts", {}).get("error", 0) for r in results),
+           "warning": sum(r.get("counts", {}).get("warning", 0) for r in results)}
     if args.format == "json":
-        shown = idicts if args.max_issues < 0 else idicts[:args.max_issues]
-        _json({"schema": SCHEMA.format("convert"), "ok": not bad, "input": args.input, "rows": len(out_rows),
-               "counts": {"error": e, "warning": w}, "files": files,
-               "issue_groups": groups, "case_coverage": cover,
-               "issues": shown, "issues_truncated": len(shown) < len(idicts),
-               "changed_cells": len(changes),
-               "verification": {"ok": ver["ok"], "summary": ver["summary"],
-                                "violations": ver["violations"][:50]},
-               "not_idempotent": idem, "lint": lint(cfg),
-               "header": {"sha": header_sha(uh), "duplicates": dups, "drift": drift}})
+        _json({"schema": SCHEMA.format("batch"), "ok": worst == 0, "totals": tot, "results": results})
     else:
-        for d in dups:
-            print(f"注意: 列名 {d!r} が重複していたため #2, #3... を付けました")
-        print(f"{len(out_rows)} 行を変換 → {files['output']}")
-        print(f"エラー {e} 件 / 警告 {w} 件")
-        _print_groups(groups)
-        for c in cover:
-            print(f"  書式の内訳 {c['column']}: "
-                  + " / ".join(f"{x['label']} {x['count']}件" for x in c["cases"])
-                  + f" / 不一致 {c['unmatched']}件")
-        print(f"値が変わったセル {len(changes)} 件")
-        s = ver["summary"]
-        print(f"変換前後チェック: {'OK' if ver['ok'] else 'NG'}（違反 {s['violations']} / 欠落 {s['lost_cells']}）")
-        print(f"レポート → {files['html']}（機械用: {Path(files['json']).name}）")
-        for k in ("report", "diff", "log"):
-            if k in files:
-                print(f"  {k} → {files[k]}")
-        for v in ver["violations"][:5]:
-            print(f"  違反 {v['kind']} {v['column']} {v['row']}行: {v['before']!r} → {v['after']!r}")
-        for b in idem:
-            print(f"注意 L102 再実行で値が変わる列 {b['column']}: {b['first']!r} → {b['second']!r}")
-        if drift and drift["changed"]:
-            print(f"注意 C003 前回(lock)から列が変わっています 増:{drift['added']} 減:{drift['removed']}")
-    return 1 if bad else 0
+        print(f"合計: {tot['files']} ファイル（変換できず {tot['failed']}）/ {tot['rows']} 行 / "
+              f"エラー {tot['error']} 件 / 警告 {tot['warning']} 件")
+    return worst
 
 
 def cmd_verify(args) -> int:
@@ -367,6 +404,16 @@ def _show_compare(args, name: str, res: dict) -> int:
     return 1 if (not res["same"] and args.fail_on != "none") else 0
 
 
+def cmd_schema(args) -> int:
+    from .schema import schema, schema_text
+    sc = schema()
+    if args.format == "json":
+        _json(sc)
+    else:
+        print(schema_text(sc))
+    return 0
+
+
 def cmd_lock(args) -> int:
     cfg = load_config(args.config)
     header, _ = read_csv(args.input, cfg.encoding_in)
@@ -400,7 +447,7 @@ def main(argv: list[str] | None = None) -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     c = sub.add_parser("convert", help="変換して 出力CSV・HTMLレポート・JSONレポート を書く")
-    c.add_argument("input")
+    c.add_argument("input", nargs="+", help="入力CSV。複数、またはフォルダ（中の *.csv すべて）も可")
     c.add_argument("-c", "--config", required=True)
     c.add_argument("-o", "--output", help="出力CSV名（既定: 入力CSVのあるフォルダの tenugui_out/<入力名>_tenugui.csv）")
     c.add_argument("--out-dir", help=f"出力フォルダ（既定: 入力CSVのあるフォルダの {OUT_DIR_NAME}/。無ければ作る）")
@@ -481,6 +528,10 @@ def main(argv: list[str] | None = None) -> int:
     _fmt(cp, "none")
     cp.set_defaults(fn=cmd_compare)
 
+    sc = sub.add_parser("schema", help="設定ファイルの書き方（キー・型・制約・preset・報告コード）を出す")
+    sc.add_argument("--format", choices=["text", "json"], default="text")
+    sc.set_defaults(fn=cmd_schema)
+
     lk = sub.add_parser("lock", help="いまのCSVの列構成を記録（以後の列の増減を検知）")
     lk.add_argument("input")
     lk.add_argument("-c", "--config", required=True)
@@ -492,6 +543,14 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
     try:
         return args.fn(args)
+    except (OSError, UnicodeError) as e:
+        msg = (f"ファイルを開けません: {e}" if isinstance(e, OSError) else
+               f"文字コードが合いません: {e}（[settings] encoding_in = \"cp932\" などを指定します）")
+        if getattr(args, "format", "text") == "json":
+            _json({"schema": SCHEMA.format("error"), "ok": False, "config_errors": [{"where": "", "message": msg}]})
+        else:
+            print(msg, file=sys.stderr)
+        return 2
     except ConfigError as e:
         if getattr(args, "format", "text") == "json":
             _json({"schema": SCHEMA.format("error"), "ok": False,
@@ -500,6 +559,7 @@ def main(argv: list[str] | None = None) -> int:
             print("設定エラー:", file=sys.stderr)
             for line in e.problems:
                 print(f"  - {line}", file=sys.stderr)
+            print("（設定の書き方は tenugui schema、値の試し打ちは tenugui try）", file=sys.stderr)
         return 2
 
 

@@ -9,7 +9,7 @@ from collections import Counter
 from dataclasses import replace
 from pathlib import Path
 
-from .core import (Config, FieldRule, Issue, _apply_field, _is_reserved, check_header, compile_pattern,
+from .core import (Config, FieldRule, Issue, _apply_field, _is_reserved, check_header, compile_pattern, is_null,
                    convert_rows, select_case, shape_of, survey as _survey, uniquify)
 from .units import UnitError, UnitTable, fold_key, normalize_text, parse_quantity
 
@@ -273,8 +273,9 @@ def as_test_block(values: dict[str, str], res: dict, name: str = "") -> str:
     if name:
         L.append(f"name = {_q(name)}")
     L.append("in = { " + ", ".join(f"{_q(k)} = {_q(v)}" for k, v in values.items()) + " }")
-    L.append("out = { " + ", ".join(f"{_q(k)} = {_q(v)}" for k, v in outs.items()) + " }")
     codes = sorted({i["code"] for i in res["issues"]})
+    if outs or not codes:
+        L.append("out = { " + ", ".join(f"{_q(k)} = {_q(v)}" for k, v in outs.items()) + " }" if outs else "out = {}")
     if codes:
         L.append("codes = [" + ", ".join(_q(c) for c in codes) + "]")
     return "\n".join(L) + "\n"
@@ -573,7 +574,7 @@ def verify_before_after(cfg: Config, header: list[str], rows: list[list[str]],
             elif c not in replaced:
                 violations.append({"kind": "untouched_changed", "column": c, "row": n,
                                    "before": before, "after": after})
-            if before.strip() and not after.strip():
+            if before.strip() and not after.strip() and not is_null(cfg, before):   # null_values は意図した空
                 st["lost"] += 1
             if len(st["sample"]) < 3:
                 st["sample"].append([before, after])
