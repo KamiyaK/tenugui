@@ -1,0 +1,51 @@
+# 1つの列に書き方が混ざっているときの例。
+#   tenugui convert examples/mixed_formats_input.csv -c examples/mixed_formats.toml
+schema_version = 1
+
+# (a) 7±2mm / 7mm±2 / 7mm±2mm の混在
+[[field]]
+src = "strip"
+preset = "tolerance"
+each = { number_only = true, strip_units = ["mm"] }
+parts = { nom = "strip_nom", tol = "strip_tol" }
+
+# (b) 3400W+238-272(15.64～18.19A) と 1250W±100W(11.5～13.5A) の混在
+[[field]]
+src = "pw"
+each = { to = "W" }
+[[field.case]]
+preset = "tolerance_range"
+parts = { nom = "w", tol = "w_tol", rlo = { out = "a_min", to = "A" }, rhi = { out = "a_max", to = "A" } }
+[[field.case]]
+pattern = "{w}W+{plus}-{minus}({lo}~{hi}A)"
+parts = { w = "w", plus = "w_plus", minus = "w_minus", lo = { out = "a_min", to = "A" }, hi = { out = "a_max", to = "A" } }
+
+# (c) 8mm, 10mm に「分光」などの決まった文字が混ざる
+[[field]]
+src = "win"
+[[field.case]]
+pattern = "#mm"
+parts = { n1 = { out = "win_mm", number_only = true, strip_units = ["mm"] } }
+[[field.case]]
+match = '^(?P<kind>分光|拡散)$'
+parts = { kind = "win_kind" }
+
+[[test]]
+name = "許容差の書き方3種"
+in = { strip = "7mm±2" }
+out = { strip_nom = "7", strip_tol = "2" }
+
+[[test]]
+name = "+ と - で書いた許容差（全角も可）"
+in = { pw = "3400W＋238－272(15.64～18.19A)" }
+out = { w = "3400", w_tol = "", w_plus = "238", w_minus = "272", a_min = "15.64", a_max = "18.19" }
+
+[[test]]
+name = "決まった文字は別の列へ"
+in = { win = "分光" }
+out = { win_mm = "", win_kind = "分光" }
+
+[[test]]
+name = "決めていない文字はエラー"
+in = { win = "その他" }
+codes = ["C111"]

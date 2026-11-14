@@ -3,6 +3,16 @@
 書き方は [Keep a Changelog](https://keepachangelog.com/ja/1.1.0/) に、版番号は [セマンティック バージョニング](https://semver.org/lang/ja/) に沿う。
 1.0.0 までは、設定ファイル（`schema_version = 1`）の既存の書き方の意味は変えない方針。
 
+## [0.10.0] - 2026-11-14
+
+### 追加
+- UI: 「形」タブ（形の集計。ルールTOMLが無くても使える）、「内訳と修正案」タブ（問題を種類ごとにまとめ、選ぶと直し方の案を表示）、「レポートを開く」ボタン
+- UI: 「検証」が `[[test]]` も実行する
+- `examples/mixed_formats.toml`: 1つの列に書き方が混ざる場合の例（許容差の書き方違い、`+`/`-` の許容差、数値に文字が混ざる列）
+
+### 変更
+- GitHub Actions の actions/checkout を v5、actions/setup-python を v6 に更新（Node.js 20 の廃止警告への対応）
+
 ## [0.9.0] - 2026-11-14
 
 ### 追加
@@ -90,6 +100,7 @@
 ### 追加
 - TOML ルールによる chozu 出力CSVの変換: 表記ゆれの統一、単位の換算・除去・付加、派生計算
 
+[0.10.0]: https://github.com/KamiyaK/tenugui/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/KamiyaK/tenugui/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/KamiyaK/tenugui/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/KamiyaK/tenugui/compare/v0.6.1...v0.7.0

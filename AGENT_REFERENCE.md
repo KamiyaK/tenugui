@@ -126,7 +126,7 @@ JSON: `convert` の `verification:{ok,summary,violations[]}`、`verify` は `{sc
 - `tenugui try ... --as-test [--name 名前]` → 今の結果を `[[test]]` のTOMLとして出力（貼る前に値が正しいか確認する）
 - `tenugui impact IN -c 新R --base 旧R --format json [--fail-on error]` → `{schema:"tenugui.impact/1", same, rows_before, rows_after, columns_added[], columns_removed[], changed_cells, columns:[{column, changed, samples[{row,key,before,after}]}], issues_before{error,warning}, issues_after, issue_changes[{column,out,code,before,after}]}`。`--fail-on error` は違いがあれば終了コード1
 - `tenugui compare 旧OUT.csv 新OUT.csv --format json` → 同じ形（issues_* なし）。行は行番号で突き合わせる
-- `tenugui --version`（`-V`）→ `tenugui 0.9.0`
+- `tenugui --version`（`-V`）→ `tenugui 0.10.0`
 - `tenugui schema [--format json]` → `{schema:"tenugui.schema/1", version, schema_version, toml:{settings, units, unit_alias, synonyms, field:{forms:{plain,split,case}, value_keys, part_only_keys, order}, derive, test}, presets{名前:{parts[]}}, preset_examples, codes{コード:{severity, meaning, hint}}, notes[]}`。各キーは `{type, desc, default?, required?, requires?, conflicts?}`
 - `tenugui convert フォルダ|IN1 IN2 ... -c R --format json` → `{schema:"tenugui.batch/1", ok, totals:{files, failed, rows, error, warning}, results:[convert と同じ辞書...]}`。フォルダは中の `*.csv`（サブフォルダは見ない）。列が足りないファイルは `results[].input_problems` に入り、残りは続行。終了コードは最も悪いもの。`-o` は使えない
 - `tenugui lock IN -c R` → R.lock.json に列構成を記録。以後 check/convert が列の増減を C003 で報告
@@ -147,6 +147,11 @@ JSON: `convert` の `verification:{ok,summary,violations[]}`、`verify` は `{sc
 ## 6b. 「A,B,CならA」
 - 値の統一（B・C も A）: `[synonyms.g]` に `"A" = ["B", "C"]`、field に `synonyms = "g"`。突合は完全一致（NFKC・大小無視・空白と `-_・` を除去）。部分一致はしない。表に無い値は `on_unknown`（warn/keep/error）
 - セル内の並び（`A,B,C` の先頭）: `extract = '^([^,、]+)'`。最後なら `extract = '([^,、]+)$'`
+
+## 6c. 書き方が混ざる列（`examples/mixed_formats.toml` に動く例）
+- `7±2mm` / `7mm±2` / `7mm±2mm` の混在 → `preset = "tolerance"` 1つで全部通る（単位は値の中で共有）。plain な `number_only` のままだと `C104 指定外の単位 '±2mm'` になる
+- `3400W+238-272(15.64~18.19A)`（± でなく + と -）→ `pattern = "{w}W+{plus}-{minus}({lo}~{hi}A)"`。± の書き方と混ざるなら `[[field.case]]` で `preset = "tolerance_range"` と並べる。全角の ＋ － ～ は半角と同じ扱い
+- 数値の列に決まった文字が混ざる（`8mm`, `10mm`, `分光`）→ `[[field.case]]` で、1つ目 `pattern = "#mm"` を数値の列へ、2つ目 `match = '^(?P<kind>分光|拡散)$'` を文字の列へ。決めていない文字は C111 で気づける
 
 ## 7. 落とし穴
 - TOML の通常文字列で `"\d"` `"\s"` は構文エラー → `'\d'`
