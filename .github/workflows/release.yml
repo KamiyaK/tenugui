@@ -1,0 +1,33 @@
+# main に入った版（pyproject.toml の version）のタグとリリースを、まだ無ければ自動で作る。
+# 版を上げて main にマージするだけで v0.8.0 のようなタグが付く。
+name: release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 版を読む
+        id: v
+        run: |
+          VER=$(python3 -c "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb'))['project']['version'])")
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+      - name: タグとリリースを作る（まだ無いときだけ）
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VER: ${{ steps.v.outputs.version }}
+        run: |
+          TAG="v$VER"
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "$TAG は既にあります"
+            exit 0
+          fi
+          awk -v v="$VER" 'index($0, "## [" v "]") == 1 {on = 1; next} /^## \[/ {on = 0} /^\[[0-9]/ {on = 0} on' CHANGELOG.md > notes.md
+          gh release create "$TAG" --target "$GITHUB_SHA" --title "Tenugui $VER" --notes-file notes.md

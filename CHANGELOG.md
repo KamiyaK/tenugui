@@ -10,7 +10,7 @@
 - JSONレポート `<名>_tenugui.json`（`tenugui.report/1`）。問題の全件・変更セル・変換前後チェックを持つ
 - 警告 C131: 変換はできたが、列の中で少数派の形の値（`[settings] rare_shape`、既定 0.05、0 で無効）
 - `tenugui --version` / `-V`
-- GitHub Actions によるテストの自動実行
+- GitHub Actions によるテストの自動実行と、main に入った版のタグ・リリースの自動作成
 
 ### 変更
 - **convert の既定の出力を3つに整理**（変換結果CSV・HTML・JSON）。`_conv.csv`・`_diff.csv`・`.log` は `--detail-files` を付けたときだけ出す
