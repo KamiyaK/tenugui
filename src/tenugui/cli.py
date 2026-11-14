@@ -15,7 +15,7 @@ from pathlib import Path
 
 from .analysis import (case_coverage, compare_outputs, convert_to_files, diff_changes, draft_toml,
                        group_issues, header_drift, header_sha, idempotency_report, impact, issue_dict, lint,
-                       lock_path, run_tests, suggest, survey_full, survey_overview, test_block, try_row,
+                       lock_path, run_tests, suggest, survey_full, survey_overview, as_test_block, try_row,
                        verify_before_after, verify_files, write_lock, write_log)
 from .core import (ConfigError, check_header, config_from_dict, convert_rows, load_config,
                    read_csv, uniquify, write_csv, write_report)
@@ -200,11 +200,11 @@ def cmd_survey(args) -> int:
     if not args.column:
         ov = survey_overview(cfg, header, rows)
         if not args.all:
-            ov = [o for o in ov if o["shape_count"] > 1]
+            ov = [o for o in ov if o["shape_count"] > 1 and any("#" in x["shape"] for x in o["shapes"])]
         if args.format == "json":
             _json({"schema": SCHEMA.format("survey_overview"), "rows": len(rows), "columns": ov})
             return 0
-        print(f"{len(rows)} 行。" + ("全列" if args.all else "形が2種類以上ある列（ばらつきのある列）") + f": {len(ov)} 列")
+        print(f"{len(rows)} 行。" + ("全列" if args.all else "数値を含み、形が2種類以上ある列（ばらつきのある列）") + f": {len(ov)} 列")
         for o in ov:
             print(f"== {o['column']}: 値あり {o['filled']} / 種類 {o['distinct']} / 形 {o['shape_count']} 種"
                   + (f" / NG {o['ng']}" if o["ng"] else ""))
@@ -260,7 +260,7 @@ def cmd_try(args) -> int:
         return 2
     res = try_row(cfg, values)
     if args.as_test:
-        print(test_block(values, res, args.name or ""))
+        print(as_test_block(values, res, args.name or ""))
         return 0
     errors = sum(1 for i in res["issues"] if i["severity"] == "E")
     bad = _failing(args.fail_on, errors, len(res["issues"]) - errors)

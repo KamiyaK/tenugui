@@ -264,7 +264,7 @@ def run_tests(cfg: Config) -> dict:
     return {"total": len(results), "failed": len(failed), "ok": not failed, "failures": failed}
 
 
-def test_block(values: dict[str, str], res: dict, name: str = "") -> str:
+def as_test_block(values: dict[str, str], res: dict, name: str = "") -> str:
     """try の結果を、そのまま設定に貼れる [[test]] にする。"""
     outs = {c: v for c, v in res["outputs"].items() if c not in values or values[c] != v}
     L = ["[[test]]"]
@@ -372,7 +372,8 @@ def suggest(cfg: Config, header: list[str], rows: list[list[str]]) -> list[dict]
         frs = by_src.get(g["column"], [])
         target = next((f for f in frs if f.out == g["out"]), frs[0] if frs else None)
         sug = {"kind": "none", "toml": "", "note": "自動の案はありません。hint を参照", "confidence": "none"}
-        if g["code"] in ("C111", "C101") and target is not None:
+        multi = g["code"] == "C104" and g["shape"].count("#") > 1     # 単位違いではなく、数値が複数ある値
+        if (g["code"] in ("C111", "C101") or multi) and target is not None:
             pat = _pattern_for(g["shape"], g["examples"])
             if pat:
                 pattern, names = pat
