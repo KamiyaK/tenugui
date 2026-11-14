@@ -3,6 +3,20 @@
 書き方は [Keep a Changelog](https://keepachangelog.com/ja/1.1.0/) に、版番号は [セマンティック バージョニング](https://semver.org/lang/ja/) に沿う。
 1.0.0 までは、設定ファイル（`schema_version = 1`）の既存の書き方の意味は変えない方針。
 
+## [0.9.0] - 2026-11-14
+
+### 追加
+- 列のまとめ指定: `src = ["a", "b"]`、`for = { n = ["0", "1"] }` と `src = "wire{n}_len"`（`out` に `{n}` と `{src}`）
+- `each`: `parts` の全部品に共通の指定
+- `parts` の短縮形: `parts = { nom = "出力列名" }`
+- `[settings] null_values`: 空として扱う値
+- `tenugui schema`: 設定の書き方（キー・型・既定値・制約・preset・報告コード）を text / JSON で出す
+- `convert` にフォルダや複数のCSVを渡せる（JSON は `tenugui.batch/1`）
+- エラーメッセージに綴りの候補（キー・列名・単位・preset・同義語表）と、TOML 構文エラーのよくある原因
+
+### 修正
+- 入力ファイルが無い・文字コードが合わないときに、トレースバックではなくメッセージを出して終了コード 2 で終わる
+
 ## [0.8.0] - 2026-11-14
 
 ### 追加
@@ -76,6 +90,7 @@
 ### 追加
 - TOML ルールによる chozu 出力CSVの変換: 表記ゆれの統一、単位の換算・除去・付加、派生計算
 
+[0.9.0]: https://github.com/KamiyaK/tenugui/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/KamiyaK/tenugui/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/KamiyaK/tenugui/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/KamiyaK/tenugui/releases/tag/v0.6.1

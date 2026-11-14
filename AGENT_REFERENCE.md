@@ -18,7 +18,7 @@
 - 数値のあとの残り全部を単位として読む。`4(二重)` は C103。`match` で分ける
 
 ## 2. キー表
-`[settings]` `encoding_in`(utf-8-sig) `encoding_out`(utf-8-sig) `passthrough`(true) `keep`([]) `reserved`(['^NG\d*$']) `on_error`(keep|empty) `rare_shape`(0.05。C131 の閾値、0 で無効)
+`[settings]` `encoding_in`(utf-8-sig) `encoding_out`(utf-8-sig) `passthrough`(true) `keep`([]) `reserved`(['^NG\d*$']) `on_error`(keep|empty) `rare_shape`(0.05。C131 の閾値、0 で無効) `null_values`([]。空として扱う値)
 
 `[units.<次元>]` `base`=基準単位、`単位 = 倍率`（文字列可: `inch = "25.4"`）。式定義: `"°C" = { to_base = "x + 273.15", from_base = "x - 273.15" }`（変数は x のみ、base は倍率で定義された単位）
 既定の次元: length mm / voltage V / current A / resistance Ω / power W / mass g / time s / pressure Pa / frequency Hz / ratio % / temperature K(°C, °F は式)
@@ -43,6 +43,23 @@
 - 列名が field の出力なら、その値(`to` の単位)を使う。`@単位` を付けるとその単位へ換算してから使う
 - 生の列は、単位なし→数値(`@`があれば C304 を警告して単位を仮定)、単位あり→`@単位` が無いと C311
 - 式: 数値・変数・`+ - * / **`(整数指数,|n|≤64)・括弧・`pi`・`abs min max round sqrt`。それ以外は設定エラー
+
+## 2a. 短く書く（0.9.0）— 新しく書く設定はこの形を使う
+- **まず `tenugui schema --format json`** を読む。キー・型・既定値・`requires` / `conflicts`・preset の部品名・報告コードが全部入っている（この文書より新しい）
+- 同じルールを複数の列に: `src = ["a", "b"]`。列名に規則があるなら `for = { n = ["0", "1"] }` + `src = "wire{n}_len"`（全ての組み合わせに展開。`out` に `{n}` と `{src}` を書ける）。展開後の出力列名が重複すると設定エラー
+- 部品に共通の指定は `each = { number_only = true, strip_units = ["mm"] }`（部品側が優先。case 形式では field の each が全 case に、case の each がその case に効く）
+- 出力列名だけの部品は短縮形: `parts = { nom = "len_nom", tol = "len_tol" }`
+- `[settings] null_values = ["-", "なし"]`: ルールのかかった列で空と同じに扱う（NFKC・大小無視の完全一致）。ルールのない列と元の列は変えない。try の trace では stage `null`
+- 標準形:
+  ```toml
+  [[field]]
+  for = { n = ["0", "1"] }
+  src = "wire{n}_length"
+  drop_src = true
+  preset = "tolerance"
+  each = { number_only = true, strip_units = ["mm"] }
+  parts = { nom = "wire{n}_len_nom", tol = "wire{n}_len_tol" }
+  ```
 
 ## 2b. 書式の指定（0.7.0）: `pattern` と `[[field.case]]`
 - `pattern = "#±#mm"`（+ `parts`）: 簡易記法。`#`=数値（部品名 n1, n2, …）、`{name}`=名前付き数値、`[...]`=省略可。数値直後の文字はその数値の単位で、**書いた単位にだけ一致**。単位のない数値は同じ括弧区間の隣の単位を借りる。空白・全角・`～` は吸収。`# [ ] { }` を文字として含む値には使えない（`match` を使う）
@@ -98,7 +115,7 @@ JSON: `convert` の `verification:{ok,summary,violations[]}`、`verify` は `{sc
 終了コード: 0 OK / 1 `--fail-on` 基準に該当 / 2 設定・使い方のエラー（JSON時も `{"schema":"tenugui.error/1","ok":false,"config_errors":[{where,message}]}` を stdout に出す）
 - `tenugui check -c R [IN] [--idempotent] [--format json] [--fail-on error|warn|none(既定error)]` → `{schema:"tenugui.check/1", ok, fields, derives, input_problems[], lint[], duplicate_columns[], header_drift, not_idempotent[]}`
 - `tenugui convert IN -c R [-o OUT] [--out-dir D] [--timestamp] [--detail-files [--no-diff]] [--verify] [--max-issues N] [--format json] [--fail-on ...(既定none)]` → OUT.csv / OUT.html / OUT.json（`--detail-files` で OUT_conv.csv(row,key,column,code,severity,message,raw,out), OUT_diff.csv(row,key,column,before,after), OUT.log）。JSON: `{schema:"tenugui.convert/1", ok, rows, counts:{error,warning}, files{output,html,json}, issues[{row,key,column,out,code,severity,message,raw,hint}], issues_truncated, changed_cells, not_idempotent[], lint[], header:{sha,duplicates,drift}}`
-- `tenugui try -c R --field 列 値 [--set 列=値 ...]` → CSVなしで1行試す。`{schema:"tenugui.try/1", ok, outputs{}, issues[], trace{出力列:[{stage,value}]}, skipped_fields[], skipped_derives[]}`。stage: case / normalize / sub / synonyms / extract / number_only / quantity / format / reserved
+- `tenugui try -c R --field 列 値 [--set 列=値 ...]` → CSVなしで1行試す。`{schema:"tenugui.try/1", ok, outputs{}, issues[], trace{出力列:[{stage,value}]}, skipped_fields[], skipped_derives[]}`。stage: null / case / normalize / sub / synonyms / extract / number_only / quantity / format / reserved
 - `tenugui survey IN -k 列 [-k 列...] [-c R] --format json` → `{columns:[{column,distinct,top_values[{value,count}],units{},unparsable,candidates[{canonical,variants[],kind:exact|similar,count}],composite_examples[]}]}`
 - `tenugui verify IN OUT_CSV -c R [--format json] [--fail-on ...(既定error)]`
 - `tenugui draft IN [-c R] [-o draft.toml(既定 tenugui_out/draft.toml)] [--stdout]` → 実態から作る下書き。exact な表記ゆれと、単位付き数値列(80%以上が読める)だけを出し、疑い(similar)は `#` コメントにする。**下書きは必ず `check` と `try` で検証してから使う**
@@ -109,10 +126,13 @@ JSON: `convert` の `verification:{ok,summary,violations[]}`、`verify` は `{sc
 - `tenugui try ... --as-test [--name 名前]` → 今の結果を `[[test]]` のTOMLとして出力（貼る前に値が正しいか確認する）
 - `tenugui impact IN -c 新R --base 旧R --format json [--fail-on error]` → `{schema:"tenugui.impact/1", same, rows_before, rows_after, columns_added[], columns_removed[], changed_cells, columns:[{column, changed, samples[{row,key,before,after}]}], issues_before{error,warning}, issues_after, issue_changes[{column,out,code,before,after}]}`。`--fail-on error` は違いがあれば終了コード1
 - `tenugui compare 旧OUT.csv 新OUT.csv --format json` → 同じ形（issues_* なし）。行は行番号で突き合わせる
-- `tenugui --version`（`-V`）→ `tenugui 0.8.0`
+- `tenugui --version`（`-V`）→ `tenugui 0.9.0`
+- `tenugui schema [--format json]` → `{schema:"tenugui.schema/1", version, schema_version, toml:{settings, units, unit_alias, synonyms, field:{forms:{plain,split,case}, value_keys, part_only_keys, order}, derive, test}, presets{名前:{parts[]}}, preset_examples, codes{コード:{severity, meaning, hint}}, notes[]}`。各キーは `{type, desc, default?, required?, requires?, conflicts?}`
+- `tenugui convert フォルダ|IN1 IN2 ... -c R --format json` → `{schema:"tenugui.batch/1", ok, totals:{files, failed, rows, error, warning}, results:[convert と同じ辞書...]}`。フォルダは中の `*.csv`（サブフォルダは見ない）。列が足りないファイルは `results[].input_problems` に入り、残りは続行。終了コードは最も悪いもの。`-o` は使えない
 - `tenugui lock IN -c R` → R.lock.json に列構成を記録。以後 check/convert が列の増減を C003 で報告
 
 ## 6. 推奨ループ（agent）
+0. `schema --format json` で書き方を確認する
 1. `survey IN --format json` で、ばらつきのある列と形を把握する（1列を詳しく見るなら `-k 列`）。または `draft`
 2. TOML を書く。複合表記は形をそのまま `pattern` に書き `parts` で列に割り当てる。形が複数ある列は `[[field.case]]`。正規表現（`match` / `extract` / `sub`）は TOML の**リテラル文字列 `'...'`**で書く（`"\d"` は構文エラー）
 3. 代表的な値を `[[test]]` にする（`try ... --as-test` の出力を、値を確認してから貼る）
