@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tenugui"
-version = "0.6.1"
+version = "0.7.0"
 description = "chozu出力CSVを TOML ルールで変換する（表記ゆれ・単位・計算）"
 requires-python = ">=3.11"
 dependencies = []

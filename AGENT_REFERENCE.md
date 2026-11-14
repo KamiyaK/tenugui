@@ -44,6 +44,16 @@
 - 生の列は、単位なし→数値(`@`があれば C304 を警告して単位を仮定)、単位あり→`@単位` が無いと C311
 - 式: 数値・変数・`+ - * / **`(整数指数,|n|≤64)・括弧・`pi`・`abs min max round sqrt`。それ以外は設定エラー
 
+## 2b. 書式の指定（0.7.0）: `pattern` と `[[field.case]]`
+- `pattern = "#±#mm"`（+ `parts`）: 簡易記法。`#`=数値（部品名 n1, n2, …）、`{name}`=名前付き数値、`[...]`=省略可。数値直後の文字はその数値の単位で、**書いた単位にだけ一致**。単位のない数値は同じ括弧区間の隣の単位を借りる。空白・全角・`～` は吸収。`# [ ] { }` を文字として含む値には使えない（`match` を使う）
+- 部品は preset と同じ扱い: `to` か `number_only` があれば単位付きで解釈、どちらも無ければ数値の文字列だけ
+- `[[field.case]]`: 1つの `[[field]]`（キーは `src`, `drop_src`, `case` のみ）の下に並べる。各 case は `pattern` | `preset` | `match` のどれか1つ + `parts`。上から順に試し最初の一致を使う。同じ `out` を複数 case で使える。一致した case に無い out は空。全て不一致は C111（1行1件、メッセージに形）。case の parts では `sub` 不可
+- 形 = NFKC後に数値を `#` にした文字列（`330±15mm` → `#±#mm`）。**survey / issue_groups / suggest が返す `shape` は、そのまま `pattern` に書ける**
+
+## 2c. `[[test]]`（0.7.0）
+- `in = { 列 = "値" }`（必須）, `out = { 出力列 = "期待値" }`, `codes = ["C111"]`（期待する報告コードの集合。省略時は空=問題なしを期待）, `name`（任意）。`out` か `codes` のどちらかは必須
+- `check` が毎回実行し、失敗はエラー扱い（終了コード1）。ルールを変えたら必ず `check`
+
 ## 3. 単位式
 `mm` `mm^2` `mm2` `mm²` `mm*mm` `m/s` `mm/min` `kg*m/s^2` を解釈。次元の指数が一致すれば換算できる（`mm^2`↔`cm2`）。式定義の単位は単独のみ（`W/°C` は不可）
 
@@ -87,20 +97,30 @@ JSON: `convert` の `verification:{ok,summary,violations[]}`、`verify` は `{sc
 終了コード: 0 OK / 1 `--fail-on` 基準に該当 / 2 設定・使い方のエラー（JSON時も `{"schema":"tenugui.error/1","ok":false,"config_errors":[{where,message}]}` を stdout に出す）
 - `tenugui check -c R [IN] [--idempotent] [--format json] [--fail-on error|warn|none(既定error)]` → `{schema:"tenugui.check/1", ok, fields, derives, input_problems[], lint[], duplicate_columns[], header_drift, not_idempotent[]}`
 - `tenugui convert IN -c R [-o OUT] [--out-dir D] [--timestamp] [--no-diff] [--verify] [--max-issues N] [--format json] [--fail-on ...(既定none)]` → OUT, OUT_conv.csv(row,key,column,code,severity,message,raw,out), `--diff` で OUT_diff.csv(row,key,column,before,after)。JSON: `{schema:"tenugui.convert/1", ok, rows, counts:{error,warning}, files, issues[{row,key,column,out,code,severity,message,raw,hint}], issues_truncated, changed_cells, not_idempotent[], lint[], header:{sha,duplicates,drift}}`
-- `tenugui try -c R --field 列 値 [--set 列=値 ...]` → CSVなしで1行試す。`{schema:"tenugui.try/1", ok, outputs{}, issues[], trace{出力列:[{stage,value}]}, skipped_fields[], skipped_derives[]}`。stage: normalize / sub / synonyms / extract / quantity / format / reserved
+- `tenugui try -c R --field 列 値 [--set 列=値 ...]` → CSVなしで1行試す。`{schema:"tenugui.try/1", ok, outputs{}, issues[], trace{出力列:[{stage,value}]}, skipped_fields[], skipped_derives[]}`。stage: case / normalize / sub / synonyms / extract / number_only / quantity / format / reserved
 - `tenugui survey IN -k 列 [-k 列...] [-c R] --format json` → `{columns:[{column,distinct,top_values[{value,count}],units{},unparsable,candidates[{canonical,variants[],kind:exact|similar,count}],composite_examples[]}]}`
 - `tenugui verify IN OUT_CSV -c R [--format json] [--fail-on ...(既定error)]`
 - `tenugui draft IN [-c R] [-o draft.toml(既定 tenugui_out/draft.toml)] [--stdout]` → 実態から作る下書き。exact な表記ゆれと、単位付き数値列(80%以上が読める)だけを出し、疑い(similar)は `#` コメントにする。**下書きは必ず `check` と `try` で検証してから使う**
+- `tenugui survey IN [--all] --format json`（`-k` なし）→ 全列の概況 `{schema:"tenugui.survey_overview/1", rows, columns:[{column, filled, ng, distinct, shape_count, shapes[{shape,count,distinct,examples[]}]}]}`。既定は数値を含み形が2種類以上の列だけ。`-k 列` の結果にも `shapes[]` が入る
+- convert の JSON に追加: `issue_groups[{column,out,code,severity,shape,count,examples[],rows[],message,hint}]`（件数順）, `case_coverage[{column,cases[{case,label,count}],unmatched,empty,ng}]`。**大きなCSVでは `--max-issues 0` を付け、`issue_groups` だけ読む**
+- `tenugui suggest IN -c R [--max-groups N] --format json` → `{schema:"tenugui.suggest/1", rows, groups:[{...issue_groupsと同じ..., suggestion:{kind, toml, note, confidence}}], groups_truncated}`。kind: `add_case`（既存の case 形式に足す）/ `to_case`（単一の書式を case 形式に直して足す）/ `to_pattern`（plain な field を分割に変える）/ `use_to` / `add_strip_unit` / `add_default_unit` / `add_synonym` / `none`。confidence: medium / low / none。**部品と出力列の対応は左からの順の推測**（`#~#mm` の2つ目は許容差ではなく上限、など）なので必ず意味を確認する。ファイルは書かない
+- `tenugui test -c R --format json` → `{schema:"tenugui.test/1", total, failed, ok, failures:[{name, in, diffs:[{column, expected, actual}]}]}`。終了コード 0/1。check の JSON にも `tests` が入る
+- `tenugui try ... --as-test [--name 名前]` → 今の結果を `[[test]]` のTOMLとして出力（貼る前に値が正しいか確認する）
+- `tenugui impact IN -c 新R --base 旧R --format json [--fail-on error]` → `{schema:"tenugui.impact/1", same, rows_before, rows_after, columns_added[], columns_removed[], changed_cells, columns:[{column, changed, samples[{row,key,before,after}]}], issues_before{error,warning}, issues_after, issue_changes[{column,out,code,before,after}]}`。`--fail-on error` は違いがあれば終了コード1
+- `tenugui compare 旧OUT.csv 新OUT.csv --format json` → 同じ形（issues_* なし）。行は行番号で突き合わせる
 - `tenugui lock IN -c R` → R.lock.json に列構成を記録。以後 check/convert が列の増減を C003 で報告
 
 ## 6. 推奨ループ（agent）
-1. `survey ... --format json` で列の実態（単位・複合表記・表記ゆれ候補）を見る / または `draft`
-2. TOML を書く（複合表記は `match`+`parts`、正規表現は TOML の**リテラル文字列 `'...'`**で書く。`"\d"` は構文エラー）
-3. `check -c R IN --format json --idempotent` → `config_errors` / `input_problems` / `lint` を直す
-4. 難しい値は `try --field 列 値 --format json` で `trace` を見て段階ごとに直す
-5. `convert IN -c R -o OUT --diff --verify --format json` → `issues[].hint` に従い直す。`changed_cells` と `OUT_diff.csv` で「意図した変更だけか」を確認する
-6. 本番の列構成が固まったら `lock`
-7. 完了条件: `counts.error == 0`、`not_idempotent == []`、`header.drift` が null か changed=false
+1. `survey IN --format json` で、ばらつきのある列と形を把握する（1列を詳しく見るなら `-k 列`）。または `draft`
+2. TOML を書く。複合表記は形をそのまま `pattern` に書き `parts` で列に割り当てる。形が複数ある列は `[[field.case]]`。正規表現（`match` / `extract` / `sub`）は TOML の**リテラル文字列 `'...'`**で書く（`"\d"` は構文エラー）
+3. 代表的な値を `[[test]]` にする（`try ... --as-test` の出力を、値を確認してから貼る）
+4. `check -c R IN --format json --idempotent` → `config_errors` / `input_problems` / `lint` / `tests.failures` を直す
+5. `convert IN -c R --verify --format json --max-issues 0` → `issue_groups` を見る
+6. 問題が残れば `suggest IN -c R --format json` → `suggestion.toml` を、`note` を読み意味を確認してから設定に入れる → 4 に戻る
+7. 既存の設定を直したときは `impact IN -c 新R --base 旧R --format json` で、意図した列・行だけが変わったか確認する
+8. 難しい値は `try --field 列 値 --format json` で `trace` を見る（case 形式は最初の stage が `case`）
+9. 本番の列構成が固まったら `lock`
+10. 完了条件: `counts.error == 0`（残すと決めた問題を除く）、`tests.failed == 0`、`verification.ok`、`not_idempotent == []`、`header.drift` が null か changed=false
 
 ## 6b. 「A,B,CならA」
 - 値の統一（B・C も A）: `[synonyms.g]` に `"A" = ["B", "C"]`、field に `synonyms = "g"`。突合は完全一致（NFKC・大小無視・空白と `-_・` を除去）。部分一致はしない。表に無い値は `on_unknown`（warn/keep/error）

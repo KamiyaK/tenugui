@@ -31,6 +31,78 @@ tenugui verify  in.csv out.csv -c rules.toml      # 変換前後の突き合わ�
 
 式で使えるもの: 数値, 変数, `+ - * / **`(整数指数), 括弧, `pi`, `abs min max round sqrt`。
 
+## 0.7.0 の追加（値のばらつきへの対応）
+
+**形の集計** — 数値を `#` に置き換えた「形」ごとに件数を出す。どんなばらつきがあるかを最初に把握する。
+
+```
+tenugui survey in.csv              # 数値を含み、形が2種類以上ある列の概況
+tenugui survey in.csv -k 列名       # 1列を詳しく（形・値・単位・表記ゆれ候補）
+```
+
+**pattern（簡易記法）** — 形をそのままルールに書ける。正規表現は不要。
+
+```toml
+[[field]]
+src = "wire_length"
+pattern = "#±#mm"          # 7±2mm → 7, 2
+parts = { n1 = { out = "len_nom", number_only = true, strip_units = ["mm"] }, n2 = { out = "len_tol", number_only = true, strip_units = ["mm"] } }
+```
+
+- `#` は数値（左から `n1`, `n2`, …）。`{nom}` と書けば名前を付けられる
+- `[ ... ]` は省略可能な部分（`{w}W[±{tol}W][({lo}~{hi}A)]`）
+- 数値の直後の文字（`mm`, `W`）はその数値の単位。書いた単位にだけ一致する（`#±#mm` は `7±2cm` に一致しない）
+- 単位のない数値は、同じ括弧区間の隣の数値の単位を借りる
+- 空白の有無、全角/半角、`～`/`~` の違いは吸収する
+
+**case（複数の書式を順に試す）** — 1つの列に書式が混ざっているとき。上から順に試し、最初に一致したものを使う。
+
+```toml
+[[field]]
+src = "wire_length"
+drop_src = true
+[[field.case]]
+pattern = "#±#mm"
+parts = { n1 = { out = "len_nom", number_only = true, strip_units = ["mm"] }, n2 = { out = "len_tol", number_only = true, strip_units = ["mm"] } }
+[[field.case]]
+pattern = "#mm"                      # 許容差なし → len_tol は空
+parts = { n1 = { out = "len_nom", number_only = true, strip_units = ["mm"] } }
+```
+
+- 各 case は `pattern` / `preset` / `match` のどれか + `parts`。同じ出力列名を複数の case で使える
+- 一致した case に無い出力列は空。どれにも一致しなければ C111（メッセージに形が入る）
+- convert は「書式の内訳」（どの case で何件通ったか・不一致の件数）を表示・ログに出す
+
+**問題の内訳** — convert は問題を「列 × コード × 形」でまとめて表示する（JSON は `issue_groups`）。
+
+**suggest** — まとめた問題ごとに、設定の修正案（TOML断片）を出す。案は推測なので、適用後に `check` で確かめる。
+
+```
+tenugui suggest in.csv -c rules.toml
+```
+
+**回帰テスト** — 設定の中に「入力 → 期待値」を書いておく。`check` と `test` で実行され、ルールを直したときに壊れていないか分かる。
+
+```toml
+[[test]]
+name = "許容差つき"
+in = { wire_length = "330±15mm" }
+out = { len_nom = "330", len_tol = "15" }
+
+[[test]]
+in = { wire_length = "不明" }
+codes = ["C111"]                     # 期待する報告コード（省略時は「問題なし」を期待）
+```
+
+`tenugui try -c rules.toml --field wire_length "330mm" --as-test` で、今の結果を `[[test]]` として出せる。
+
+**影響差分** — ルールを変えたとき、同じ入力の出力がどう変わるかを出す。
+
+```
+tenugui impact in.csv -c rules.toml --base rules_old.toml     # 設定の前後
+tenugui compare old_out.csv new_out.csv                        # 出力CSV同士
+```
+
 ## 0.6.0 の追加
 - **`number_only` は「指定した単位だけ」処理する**: `strip_units` に捨ててよい単位を必ず書く。それ以外の単位は黙って捨てず `C104` エラーにして元の値を残す。換算はしない
   ```toml
