@@ -18,7 +18,7 @@
 - 数値のあとの残り全部を単位として読む。`4(二重)` は C103。`match` で分ける
 
 ## 2. キー表
-`[settings]` `encoding_in`(utf-8-sig) `encoding_out`(utf-8-sig) `passthrough`(true) `keep`([]) `reserved`(['^NG\d*$']) `on_error`(keep|empty)
+`[settings]` `encoding_in`(utf-8-sig) `encoding_out`(utf-8-sig) `passthrough`(true) `keep`([]) `reserved`(['^NG\d*$']) `on_error`(keep|empty) `rare_shape`(0.05。C131 の閾値、0 で無効)
 
 `[units.<次元>]` `base`=基準単位、`単位 = 倍率`（文字列可: `inch = "25.4"`）。式定義: `"°C" = { to_base = "x + 273.15", from_base = "x - 273.15" }`（変数は x のみ、base は倍率で定義された単位）
 既定の次元: length mm / voltage V / current A / resistance Ω / power W / mass g / time s / pressure Pa / frequency Hz / ratio % / temperature K(°C, °F は式)
@@ -48,7 +48,7 @@
 - `pattern = "#±#mm"`（+ `parts`）: 簡易記法。`#`=数値（部品名 n1, n2, …）、`{name}`=名前付き数値、`[...]`=省略可。数値直後の文字はその数値の単位で、**書いた単位にだけ一致**。単位のない数値は同じ括弧区間の隣の単位を借りる。空白・全角・`～` は吸収。`# [ ] { }` を文字として含む値には使えない（`match` を使う）
 - 部品は preset と同じ扱い: `to` か `number_only` があれば単位付きで解釈、どちらも無ければ数値の文字列だけ
 - `[[field.case]]`: 1つの `[[field]]`（キーは `src`, `drop_src`, `case` のみ）の下に並べる。各 case は `pattern` | `preset` | `match` のどれか1つ + `parts`。上から順に試し最初の一致を使う。同じ `out` を複数 case で使える。一致した case に無い out は空。全て不一致は C111（1行1件、メッセージに形）。case の parts では `sub` 不可
-- 形 = NFKC後に数値を `#` にした文字列（`330±15mm` → `#±#mm`）。**survey / issue_groups / suggest が返す `shape` は、そのまま `pattern` に書ける**
+- 形 = NFKC後に数値を `#` にした文字列（`330±15mm` → `#±#mm`、桁区切りは残る: `1,200V` → `#,#V`）。**survey / issue_groups / suggest が返す `shape` は、そのまま `pattern` に書ける**
 
 ## 2c. `[[test]]`（0.7.0）
 - `in = { 列 = "値" }`（必須）, `out = { 出力列 = "期待値" }`, `codes = ["C111"]`（期待する報告コードの集合。省略時は空=問題なしを期待）, `name`（任意）。`out` か `codes` のどちらかは必須
@@ -59,7 +59,7 @@
 
 ## 3b. 出力ファイル（convert）
 既定の出力先 = 入力CSVのあるフォルダの `tenugui_out/`（無ければ作成）。`--out-dir` で変更、`-o` で出力CSV名、`--timestamp` で `_YYYYmmdd_HHMMSS` 付き。
-`<名>_tenugui.csv`（結果）`<名>_tenugui_conv.csv`（報告）`<名>_tenugui_diff.csv`（変更セル。`--no-diff` で省略）`<名>_tenugui.log`（実行ログ: コマンド・設定sha・前後チェック・問題一覧）
+出力は3つ: `<名>_tenugui.csv`（変換結果）/ `<名>_tenugui.html`（人が見るレポート。1ページ・単体で開ける。問題セルに色）/ `<名>_tenugui.json`（機械が読むレポート `tenugui.report/1`: version, time, command, input, config, config_sha, header_sha, rows, counts, files, issue_groups[], case_coverage[], issues[]（全件・raw つき）, changes[{row,key,column,before,after}], verification, not_idempotent[], lint[], header_drift）。**後から結果を調べるときは JSON を読む**。`--detail-files` で従来の `_conv.csv`（問題一覧）`_diff.csv`（変更セル。`--no-diff` で省略）`.log` も書く
 
 ## 3b2. 元の列の削除 `drop_src`
 `drop_src = true`（field / preset / match の行）で、元の列を出力から消す。`out = src`（元の列への置換）との併用は設定エラー。消した列は verification.dropped_columns:[{column, failed_rows}] に出る（意図した削除なので違反にはならない）。失敗行の元の値は *_conv.csv の raw とログに残る。派生の vars は消した列も参照できる
@@ -81,6 +81,7 @@ JSON: `convert` の `verification:{ok,summary,violations[]}`、`verify` は `{sc
 | C104 | E | number_only で strip_units に無い単位 | strip_units に加える、または to で換算する |
 | C111 | E | match/extract 不一致 | `try` で正規表現を試す（NFKC後の文字で書く） |
 | C121 | W/E | 同義語表に無い | [synonyms.*] に追加（on_unknown=error のとき E） |
+| C131 | W | 変換はできたが、その列では少数派の形（単位なし・桁区切り `1,200`・書き方違い）。値のある行が20以上の、数値として読む通常の field と preset が対象（pattern / match / case は対象外） | 正しければ放置可。別の書式なら case を足す。無効化は `[settings] rare_shape = 0`（既定 0.05 = 5%以下） |
 | C201 | E | 必須が空 | 入力の欠落、または match の該当部分なし |
 | C301 | E | 派生の入力が数値として読めない | 上流 field で数値化 |
 | C302 | W | 派生の入力がNG印 | 情報のみ |
@@ -96,7 +97,7 @@ JSON: `convert` の `verification:{ok,summary,violations[]}`、`verify` は `{sc
 ## 5. CLI と JSON（`--format json` は stdout に1行のJSON）
 終了コード: 0 OK / 1 `--fail-on` 基準に該当 / 2 設定・使い方のエラー（JSON時も `{"schema":"tenugui.error/1","ok":false,"config_errors":[{where,message}]}` を stdout に出す）
 - `tenugui check -c R [IN] [--idempotent] [--format json] [--fail-on error|warn|none(既定error)]` → `{schema:"tenugui.check/1", ok, fields, derives, input_problems[], lint[], duplicate_columns[], header_drift, not_idempotent[]}`
-- `tenugui convert IN -c R [-o OUT] [--out-dir D] [--timestamp] [--no-diff] [--verify] [--max-issues N] [--format json] [--fail-on ...(既定none)]` → OUT, OUT_conv.csv(row,key,column,code,severity,message,raw,out), `--diff` で OUT_diff.csv(row,key,column,before,after)。JSON: `{schema:"tenugui.convert/1", ok, rows, counts:{error,warning}, files, issues[{row,key,column,out,code,severity,message,raw,hint}], issues_truncated, changed_cells, not_idempotent[], lint[], header:{sha,duplicates,drift}}`
+- `tenugui convert IN -c R [-o OUT] [--out-dir D] [--timestamp] [--detail-files [--no-diff]] [--verify] [--max-issues N] [--format json] [--fail-on ...(既定none)]` → OUT.csv / OUT.html / OUT.json（`--detail-files` で OUT_conv.csv(row,key,column,code,severity,message,raw,out), OUT_diff.csv(row,key,column,before,after), OUT.log）。JSON: `{schema:"tenugui.convert/1", ok, rows, counts:{error,warning}, files{output,html,json}, issues[{row,key,column,out,code,severity,message,raw,hint}], issues_truncated, changed_cells, not_idempotent[], lint[], header:{sha,duplicates,drift}}`
 - `tenugui try -c R --field 列 値 [--set 列=値 ...]` → CSVなしで1行試す。`{schema:"tenugui.try/1", ok, outputs{}, issues[], trace{出力列:[{stage,value}]}, skipped_fields[], skipped_derives[]}`。stage: case / normalize / sub / synonyms / extract / number_only / quantity / format / reserved
 - `tenugui survey IN -k 列 [-k 列...] [-c R] --format json` → `{columns:[{column,distinct,top_values[{value,count}],units{},unparsable,candidates[{canonical,variants[],kind:exact|similar,count}],composite_examples[]}]}`
 - `tenugui verify IN OUT_CSV -c R [--format json] [--fail-on ...(既定error)]`
@@ -108,6 +109,7 @@ JSON: `convert` の `verification:{ok,summary,violations[]}`、`verify` は `{sc
 - `tenugui try ... --as-test [--name 名前]` → 今の結果を `[[test]]` のTOMLとして出力（貼る前に値が正しいか確認する）
 - `tenugui impact IN -c 新R --base 旧R --format json [--fail-on error]` → `{schema:"tenugui.impact/1", same, rows_before, rows_after, columns_added[], columns_removed[], changed_cells, columns:[{column, changed, samples[{row,key,before,after}]}], issues_before{error,warning}, issues_after, issue_changes[{column,out,code,before,after}]}`。`--fail-on error` は違いがあれば終了コード1
 - `tenugui compare 旧OUT.csv 新OUT.csv --format json` → 同じ形（issues_* なし）。行は行番号で突き合わせる
+- `tenugui --version`（`-V`）→ `tenugui 0.8.0`
 - `tenugui lock IN -c R` → R.lock.json に列構成を記録。以後 check/convert が列の増減を C003 で報告
 
 ## 6. 推奨ループ（agent）

@@ -1,7 +1,12 @@
-# tenugui（仮称）
+# Tenugui
 
 chozuの出力CSVを、TOMLルールで変換する。標準ライブラリのみ（Python 3.11+）。
-手水(chozu)で手を洗ったあとに拭く → 手拭い(tenugui)。名前は後で変えてよい。
+手水(chozu)で手を洗ったあとに拭く → 手拭い(tenugui)。
+
+```
+pip install git+https://github.com/KamiyaK/tenugui      # 版を指定するなら末尾に @v0.8.0
+tenugui --version
+```
 
 ```
 tenugui survey  in.csv -c rules.toml -k 列名      # ルールを書く前に値の実態を数える
@@ -9,7 +14,7 @@ tenugui check   -c rules.toml [in.csv]            # 設定の検証（CSVを渡�
 tenugui draft   in.csv -o draft.toml              # 実態からルールの下書きを作る
 tenugui try     -c rules.toml --field 列 値        # CSVなしで1つの値を試す
 tenugui ui                                        # 簡易UI
-tenugui convert in.csv -c rules.toml              # in.csv のあるフォルダの tenugui_out/ に結果・レポート・差分・ログ
+tenugui convert in.csv -c rules.toml              # in.csv のあるフォルダの tenugui_out/ に 結果CSV・HTMLレポート・JSONレポート
 tenugui verify  in.csv out.csv -c rules.toml      # 変換前後の突き合わせ検証
 ```
 
@@ -30,6 +35,28 @@ tenugui verify  in.csv out.csv -c rules.toml      # 変換前後の突き合わ�
 | `[[derive]]` | `out` `expr` `vars` `unit` `unit_out` `decimals` `after` | 宣言順に評価。`vars = { d = "列名@mm" }` で換算してから計算 |
 
 式で使えるもの: 数値, 変数, `+ - * / **`(整数指数), 括弧, `pi`, `abs min max round sqrt`。
+
+変更履歴は [CHANGELOG.md](CHANGELOG.md)。版は `tenugui --version` で確認できる。
+
+## 0.8.0 の追加
+
+**出力は3つ** — `tenugui_out/` に次を書く。
+
+| ファイル | 用途 |
+|---|---|
+| `<名>_tenugui.csv` | 変換結果 |
+| `<名>_tenugui.html` | 人が見るレポート（1ページ。ブラウザで開くだけ） |
+| `<名>_tenugui.json` | 機械が読むレポート（問題の全件・変更セル・前後チェック） |
+
+従来の `_conv.csv`・`_diff.csv`・`.log` は `--detail-files` を付けたときだけ出す（同じ内容は JSON に入っている）。
+
+**HTMLレポート** — ルールのかかった列について「元の値 → 変換後」を並べ、セルに色を付ける。
+赤 = 変換できなかった値、黄 = 変換したが要確認、緑 = 変換した値、灰 = 抽出NG印。「問題のある行だけ表示」で絞れる。
+2000 行を超える入力では、問題のある行だけを表に載せる。
+
+**少数派の形の警告（C131）** — 変換はできたが、その列の中で少数派の形の値を警告する（`7mm` が並ぶ列の `7` や `1,200mm` など）。
+誤変換の見落としを減らすためのもので、値は変換する。値のある行が 20 以上の列が対象。`[settings] rare_shape = 0` で無効、既定は 0.05（5% 以下）。
+`pattern` / `match` / `case` で形を明示した列は対象外。
 
 ## 0.7.0 の追加（値のばらつきへの対応）
 
@@ -173,4 +200,4 @@ C305 派生: 換算不可 / C311 単位付き生値に `@単位` 指定なし
 - `[[derive]]` は `unit`（式の結果の単位）と `to`（その単位へ換算して出力）を持てる
 - 別名列(`out` が `src` と違う)で変換に失敗したときは空にする（生の複合文字列を複製しない）
 
-`examples/` に sample.toml と sample_input.csv。`pytest` で139テスト。
+`examples/` に sample.toml と sample_input.csv。テストは `pytest`。
