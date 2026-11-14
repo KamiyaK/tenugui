@@ -387,14 +387,15 @@ def suggest(cfg: Config, header: list[str], rows: list[list[str]]) -> list[dict]
                     else:
                         parts.append(f"{n} = {_part_toml(target, g['column'] + '_' + n)}")
                 body = f"pattern = {_q(pattern)}\nparts = {{ {', '.join(parts)} }}\n"
+                conf = "medium" if len(names) == 1 else "low"   # 数値が複数あると、どれがどの列かは推測
                 if target.case_rx:
-                    sug = {"kind": "add_case", "toml": "[[field.case]]\n" + body, "confidence": "medium",
+                    sug = {"kind": "add_case", "toml": "[[field.case]]\n" + body, "confidence": conf,
                            "note": f"src = {g['column']!r} の [[field]] の最後に、この case を足す。"
                                    "部品と出力列の対応は左からの順で当てた推測なので確認する"}
                 elif matcher:
-                    sug = {"kind": "to_case", "toml": "[[field.case]]\n" + body, "confidence": "medium",
+                    sug = {"kind": "to_case", "toml": "[[field.case]]\n" + body, "confidence": conf,
                            "note": f"src = {g['column']!r} の [[field]] を case 形式に直す: 今の "
-                                   f"{'preset / match / pattern'} と parts を1つ目の [[field.case]] に移し、"
+                                   "preset / match / pattern と parts を1つ目の [[field.case]] に移し、"
                                    "この case を2つ目に足す。部品と出力列の対応は推測なので確認する"}
                 else:
                     sug = {"kind": "to_pattern", "toml": f"[[field]]\nsrc = {_q(g['column'])}\n" + body,
@@ -622,6 +623,13 @@ def write_log(path: str | Path, info: dict) -> None:
     d = info.get("drift")
     if d and d["changed"]:
         L.append(f"注意 C003 前回(lock)から列が変わっています 増:{d['added']} 減:{d['removed']}")
+    if info.get("groups"):
+        L += ["", "[問題の内訳（列 × コード × 形）]"]
+        L += [f"  {g['count']} 件 {g['code']} {g['out'] or g['column']} 形 {g['shape']} 例 {g['examples']}"
+              for g in info["groups"][:100]]
+    for c in info.get("coverage", []):
+        L.append(f"書式の内訳 {c['column']}: " + " / ".join(f"{x['label']} {x['count']}件" for x in c["cases"])
+                 + f" / 不一致 {c['unmatched']}件")
     L += ["", "[問題一覧]"]
     L += [f"  {i['severity']} {i['code']} {i['row']}行 {i['key']} {i['out'] or i['column']}: "
           f"{i['message']} (値: {i['raw']!r})" for i in info["issues"]] or ["  なし"]
@@ -690,7 +698,8 @@ def convert_to_files(cfg: Config, config_path: str, input_path: str, header: lis
     write_log(logp, {"command": command, "input": input_path, "config": config_path or "(設定なし)",
                      "config_sha": sha, "header_sha": header_sha(uh), "rows": len(out_rows),
                      "errors": e, "warnings": len(issues) - e, "files": files, "verification": ver,
-                     "not_idempotent": idem, "lint": lint(cfg), "drift": drift, "issues": idicts})
+                     "not_idempotent": idem, "lint": lint(cfg), "drift": drift, "issues": idicts,
+                     "groups": group_issues(issues), "coverage": case_coverage(cfg, header, rows)})
     return {"out_header": out_header, "out_rows": out_rows, "issues": issues, "idicts": idicts,
             "changes": changes, "verification": ver, "not_idempotent": idem, "drift": drift,
             "files": files, "errors": e, "warnings": len(issues) - e, "duplicates": dups,

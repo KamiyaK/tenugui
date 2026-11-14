@@ -1,4 +1,4 @@
-"""コマンドライン: convert / check / survey / draft / try / lock / ui
+"""コマンドライン: convert / check / survey / draft / try / test / suggest / impact / compare / verify / lock / ui
 
 人向けは既定のテキスト、agent向けは --format json（スキーマ名 tenugui.*/1）。
 終了コード: 0=OK  1=--fail-on の基準に該当  2=設定・使い方のエラー
@@ -13,9 +13,10 @@ import re
 import sys
 from pathlib import Path
 
-from .analysis import (convert_to_files, diff_changes, draft_toml, header_drift, header_sha, idempotency_report,
-                       issue_dict, lint, lock_path, survey_full, try_row, verify_before_after,
-                       verify_files, write_lock, write_log)
+from .analysis import (case_coverage, compare_outputs, convert_to_files, diff_changes, draft_toml,
+                       group_issues, header_drift, header_sha, idempotency_report, impact, issue_dict, lint,
+                       lock_path, run_tests, suggest, survey_full, survey_overview, test_block, try_row,
+                       verify_before_after, verify_files, write_lock, write_log)
 from .core import (ConfigError, check_header, config_from_dict, convert_rows, load_config,
                    read_csv, uniquify, write_csv, write_report)
 
@@ -53,15 +54,19 @@ def cmd_check(args) -> int:
         if args.idempotent:
             idem = idempotency_report(cfg, header, rows)
     warns = lint(cfg)
-    errors = len(probs)
+    tests = run_tests(cfg)
+    errors = len(probs) + tests["failed"]
     nwarn = len(warns) + len(idem) + (1 if drift and drift["changed"] else 0)
     bad = _failing(args.fail_on, errors, nwarn)
     if args.format == "json":
         _json({"schema": SCHEMA.format("check"), "ok": not bad, "fields": len(cfg.fields),
                "derives": len(cfg.derives), "input_problems": probs, "lint": warns,
-               "duplicate_columns": dups, "header_drift": drift, "not_idempotent": idem})
+               "duplicate_columns": dups, "header_drift": drift, "not_idempotent": idem, "tests": tests})
     else:
         print(f"設定OK: field {len(cfg.fields)} 件 / derive {len(cfg.derives)} 件")
+        if tests["total"]:
+            print(f"テスト: {tests['total'] - tests['failed']}/{tests['total']} 件 合格")
+        _print_failures(tests)
         for d in dups:
             print(f"注意: 列名 {d!r} が重複しているため #2, #3... を付けて区別します")
         for p in probs:
@@ -73,6 +78,22 @@ def cmd_check(args) -> int:
         for b in idem:
             print(f"注意 L102 再実行で値が変わる列 {b['column']}: {b['first']!r} → {b['second']!r}（{b['row']}行目）")
     return 1 if bad else 0
+
+
+def _print_failures(tests: dict) -> None:
+    for f in tests["failures"]:
+        print(f"NG テスト {f['name']}: 入力 {f['in']}")
+        for d in f["diffs"]:
+            print(f"     {d['column']}: 期待 {d['expected']!r} / 実際 {d['actual']!r}")
+
+
+def _print_groups(groups: list[dict], limit: int = 10) -> None:
+    for g in groups[:limit]:
+        print(f"  {g['count']:5d} 件  {g['code']} {g['column']}"
+              + (f" → {g['out']}" if g["out"] and g["out"] != g["column"] else "")
+              + (f"  形 {g['shape']}" if g["shape"] else "") + (f"  例 {g['examples']}" if g["examples"] else ""))
+    if len(groups) > limit:
+        print(f"  …ほか {len(groups) - limit} グループ")
 
 
 # ---------------------------------------------------------------- convert
@@ -120,10 +141,13 @@ def cmd_convert(args) -> int:
     nwarn = w + len(idem) + (1 if drift and drift["changed"] else 0)
     bad = _failing("error" if args.strict and args.fail_on == "none" else args.fail_on, e + nviol, nwarn)
     idicts = r["idicts"]
+    groups = group_issues(issues)
+    cover = case_coverage(cfg, header, rows)
     if args.format == "json":
         shown = idicts if args.max_issues < 0 else idicts[:args.max_issues]
         _json({"schema": SCHEMA.format("convert"), "ok": not bad, "input": args.input, "rows": len(out_rows),
                "counts": {"error": e, "warning": w}, "files": files,
+               "issue_groups": groups, "case_coverage": cover,
                "issues": shown, "issues_truncated": len(shown) < len(idicts),
                "changed_cells": len(changes),
                "verification": {"ok": ver["ok"], "summary": ver["summary"],
@@ -135,6 +159,11 @@ def cmd_convert(args) -> int:
             print(f"注意: 列名 {d!r} が重複していたため #2, #3... を付けました")
         print(f"{len(out_rows)} 行を変換 → {files['output']}")
         print(f"エラー {e} 件 / 警告 {w} 件 → {rep}")
+        _print_groups(groups)
+        for c in cover:
+            print(f"  書式の内訳 {c['column']}: "
+                  + " / ".join(f"{x['label']} {x['count']}件" for x in c["cases"])
+                  + f" / 不一致 {c['unmatched']}件")
         print(f"値が変わったセル {len(changes)} 件" + ("" if args.no_diff else f" → {files['diff']}"))
         s = ver["summary"]
         print(f"変換前後チェック: {'OK' if ver['ok'] else 'NG'}（違反 {s['violations']} / 欠落 {s['lost_cells']}）")
@@ -168,6 +197,20 @@ def cmd_verify(args) -> int:
 def cmd_survey(args) -> int:
     cfg = _cfg(args)
     header, rows = read_csv(args.input, cfg.encoding_in)
+    if not args.column:
+        ov = survey_overview(cfg, header, rows)
+        if not args.all:
+            ov = [o for o in ov if o["shape_count"] > 1]
+        if args.format == "json":
+            _json({"schema": SCHEMA.format("survey_overview"), "rows": len(rows), "columns": ov})
+            return 0
+        print(f"{len(rows)} 行。" + ("全列" if args.all else "形が2種類以上ある列（ばらつきのある列）") + f": {len(ov)} 列")
+        for o in ov:
+            print(f"== {o['column']}: 値あり {o['filled']} / 種類 {o['distinct']} / 形 {o['shape_count']} 種"
+                  + (f" / NG {o['ng']}" if o["ng"] else ""))
+            for sh in o["shapes"]:
+                print(f"  {sh['count']:6d}  {sh['shape']}    例 {sh['examples'][0]!r}")
+        return 0
     res = [survey_full(cfg, header, rows, c, args.top) for c in args.column]
     if args.format == "json":
         _json({"schema": SCHEMA.format("survey"), "columns": [
@@ -177,6 +220,9 @@ def cmd_survey(args) -> int:
         print(f"== {s['column']}: 種類 {s['distinct']} / 単位 {s['units']} / 数値+単位として読めない {s['unparsable']}")
         for v, n in s["top_values"]:
             print(f"  {n:6d}  {v!r}")
+        print("  形（数値を # にしたもの。pattern にそのまま使える）:")
+        for sh in s["shapes"]:
+            print(f"  {sh['count']:6d}  {sh['shape']}    例 {sh['examples'][0]!r}")
         for c in s["candidates"]:
             print(f"  表記ゆれ候補({c['kind']}): {c['canonical']!r} ← {c['variants']}  計{c['count']}件")
         if s["composite_examples"]:
@@ -213,6 +259,9 @@ def cmd_try(args) -> int:
         print("--field 列名 値 か --set 列名=値 を指定してください", file=sys.stderr)
         return 2
     res = try_row(cfg, values)
+    if args.as_test:
+        print(test_block(values, res, args.name or ""))
+        return 0
     errors = sum(1 for i in res["issues"] if i["severity"] == "E")
     bad = _failing(args.fail_on, errors, len(res["issues"]) - errors)
     if args.format == "json":
@@ -228,6 +277,91 @@ def cmd_try(args) -> int:
         if res["skipped_derives"]:
             print(f"  （入力が足りず実行しなかった派生: {res['skipped_derives']}）")
     return 1 if bad else 0
+
+
+def cmd_test(args) -> int:
+    cfg = load_config(args.config)
+    res = run_tests(cfg)
+    if args.format == "json":
+        _json({"schema": SCHEMA.format("test"), **res})
+    else:
+        if not res["total"]:
+            print("[[test]] がありません（tenugui try ... --as-test で作れます）")
+        else:
+            print(f"テスト: {res['total'] - res['failed']}/{res['total']} 件 合格")
+        _print_failures(res)
+    return 0 if res["ok"] else 1
+
+
+def cmd_suggest(args) -> int:
+    cfg = load_config(args.config)
+    header, rows = read_csv(args.input, cfg.encoding_in)
+    uh, _ = uniquify(header)
+    probs = check_header(cfg, uh)
+    if probs:
+        raise ConfigError(probs)
+    groups = suggest(cfg, header, rows)
+    total = len(groups)
+    if args.max_groups >= 0:
+        groups = groups[:args.max_groups]
+    if args.format == "json":
+        _json({"schema": SCHEMA.format("suggest"), "rows": len(rows), "groups": groups,
+               "groups_truncated": len(groups) < total})
+        return 0
+    if not groups:
+        print("修正が必要な問題はありません")
+    for g in groups:
+        print(f"== {g['count']} 件  {g['code']} {g['column']}"
+              + (f" → {g['out']}" if g["out"] and g["out"] != g["column"] else "")
+              + (f"  形 {g['shape']}" if g["shape"] else ""))
+        print(f"   例 {g['examples']}  行 {g['rows']}")
+        sg = g["suggestion"]
+        print(f"   案（確度 {sg['confidence']}）: {sg['note']}")
+        for line in sg["toml"].splitlines():
+            print(f"     {line}")
+    return 0
+
+
+def cmd_impact(args) -> int:
+    new = load_config(args.config)
+    base = load_config(args.base)
+    header, rows = read_csv(args.input, new.encoding_in)
+    uh, _ = uniquify(header)
+    probs = check_header(new, uh) + [f"(base) {x}" for x in check_header(base, uh)]
+    if probs:
+        raise ConfigError(probs)
+    res = impact(base, new, header, rows)
+    return _show_compare(args, "impact", res)
+
+
+def cmd_compare(args) -> int:
+    h1, r1 = read_csv(args.before, args.encoding)
+    h2, r2 = read_csv(args.after, args.encoding)
+    return _show_compare(args, "compare", compare_outputs(h1, r1, h2, r2))
+
+
+def _show_compare(args, name: str, res: dict) -> int:
+    if args.format == "json":
+        _json({"schema": SCHEMA.format(name), **res})
+    else:
+        if res["same"]:
+            print("出力に違いはありません")
+        else:
+            print(f"行 {res['rows_before']}→{res['rows_after']} / 値が変わったセル {res['changed_cells']} 件")
+        if res["columns_added"]:
+            print(f"増えた列: {res['columns_added']}")
+        if res["columns_removed"]:
+            print(f"消えた列: {res['columns_removed']}")
+        for c in res["columns"]:
+            print(f"== {c['column']}: {c['changed']} 件")
+            for x in c["samples"]:
+                print(f"   {x['row']}行 {x['key']}: {x['before']!r} → {x['after']!r}")
+        if "issues_before" in res:
+            b, a = res["issues_before"], res["issues_after"]
+            print(f"問題: エラー {b['error']}→{a['error']} / 警告 {b['warning']}→{a['warning']}")
+            for x in res["issue_changes"]:
+                print(f"   {x['code']} {x['out'] or x['column']}: {x['before']}→{x['after']}")
+    return 1 if (not res["same"] and args.fail_on != "none") else 0
 
 
 def cmd_lock(args) -> int:
@@ -283,7 +417,9 @@ def main(argv: list[str] | None = None) -> int:
     s = sub.add_parser("survey", help="ルールを書く前に列の値の実態・表記ゆれ候補を数える")
     s.add_argument("input")
     s.add_argument("-c", "--config")
-    s.add_argument("--column", "-k", action="append", required=True)
+    s.add_argument("--column", "-k", action="append",
+                   help="調べる列（複数可）。省略すると全列の概況（形が2種類以上ある列）")
+    s.add_argument("--all", action="store_true", help="概況で、形が1種類の列も出す")
     s.add_argument("--top", type=int, default=30)
     s.add_argument("--format", choices=["text", "json"], default="text")
     s.set_defaults(fn=cmd_survey)
@@ -306,8 +442,36 @@ def main(argv: list[str] | None = None) -> int:
     t.add_argument("-c", "--config", required=True)
     t.add_argument("--field", nargs=2, action="append", metavar=("列名", "値"))
     t.add_argument("--set", action="append", metavar="列名=値")
+    t.add_argument("--as-test", action="store_true", help="結果を、設定に貼れる [[test]] として出す")
+    t.add_argument("--name", help="--as-test で付けるテスト名")
     _fmt(t, "none")
     t.set_defaults(fn=cmd_try)
+
+    ts = sub.add_parser("test", help="設定内の [[test]]（入力→期待値）を実行する")
+    ts.add_argument("-c", "--config", required=True)
+    ts.add_argument("--format", choices=["text", "json"], default="text")
+    ts.set_defaults(fn=cmd_test)
+
+    sg = sub.add_parser("suggest", help="問題を 列×形 でまとめ、設定の修正案（TOML断片）を出す")
+    sg.add_argument("input")
+    sg.add_argument("-c", "--config", required=True)
+    sg.add_argument("--max-groups", type=int, default=-1, help="出すグループの最大数（-1=全部）")
+    sg.add_argument("--format", choices=["text", "json"], default="text")
+    sg.set_defaults(fn=cmd_suggest)
+
+    im = sub.add_parser("impact", help="設定の変更前後で、同じ入力の出力がどう変わるかを出す")
+    im.add_argument("input")
+    im.add_argument("-c", "--config", required=True, help="変更後の設定")
+    im.add_argument("--base", required=True, help="変更前の設定")
+    _fmt(im, "none")
+    im.set_defaults(fn=cmd_impact)
+
+    cp = sub.add_parser("compare", help="2つの出力CSV（前・後）を比べる")
+    cp.add_argument("before")
+    cp.add_argument("after")
+    cp.add_argument("--encoding", default="utf-8-sig")
+    _fmt(cp, "none")
+    cp.set_defaults(fn=cmd_compare)
 
     lk = sub.add_parser("lock", help="いまのCSVの列構成を記録（以後の列の増減を検知）")
     lk.add_argument("input")
