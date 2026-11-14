@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tenugui"
+version = "0.6.1"
+description = "chozu出力CSVを TOML ルールで変換する（表記ゆれ・単位・計算）"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+tenugui = "tenugui.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
