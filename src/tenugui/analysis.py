@@ -273,8 +273,9 @@ def as_test_block(values: dict[str, str], res: dict, name: str = "") -> str:
     if name:
         L.append(f"name = {_q(name)}")
     L.append("in = { " + ", ".join(f"{_q(k)} = {_q(v)}" for k, v in values.items()) + " }")
-    L.append("out = { " + ", ".join(f"{_q(k)} = {_q(v)}" for k, v in outs.items()) + " }")
     codes = sorted({i["code"] for i in res["issues"]})
+    if outs or not codes:
+        L.append("out = { " + ", ".join(f"{_q(k)} = {_q(v)}" for k, v in outs.items()) + " }" if outs else "out = {}")
     if codes:
         L.append("codes = [" + ", ".join(_q(c) for c in codes) + "]")
     return "\n".join(L) + "\n"
