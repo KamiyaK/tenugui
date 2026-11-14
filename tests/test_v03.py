@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 import sys
 from collections import Counter
@@ -200,7 +201,8 @@ def test_cli_lock_then_drift_warning(files, capsys):
 
 def test_python_dash_m_works(files):
     r = subprocess.run([sys.executable, "-m", "tenugui", "check", "-c", str(files / "r.toml")],
-                       capture_output=True, text=True, env={"PYTHONPATH": str(Path(__file__).parents[1] / "src")})
+                       capture_output=True, encoding="utf-8",      # tenugui は環境によらず UTF-8 で出力する
+                       env={**os.environ, "PYTHONPATH": str(Path(__file__).parents[1] / "src")})
     assert r.returncode == 0 and "設定OK" in r.stdout
 
 
