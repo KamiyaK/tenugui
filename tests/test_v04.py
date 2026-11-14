@@ -97,8 +97,11 @@ def test_default_output_goes_to_tenugui_out_next_to_input_and_is_created(work, c
     assert not out_dir.exists()
     code, out = run(capsys, "convert", work / "data" / "in.csv", "-c", work / "r.toml")
     assert code == 0 and out_dir.is_dir()
+    assert sorted(p.name for p in out_dir.iterdir()) == ["in_tenugui.csv", "in_tenugui.html", "in_tenugui.json"]
+    code, out = run(capsys, "convert", work / "data" / "in.csv", "-c", work / "r.toml", "--detail-files")
     names = sorted(p.name for p in out_dir.iterdir())
-    assert names == ["in_tenugui.csv", "in_tenugui.log", "in_tenugui_conv.csv", "in_tenugui_diff.csv"]
+    assert names == ["in_tenugui.csv", "in_tenugui.html", "in_tenugui.json", "in_tenugui.log",
+                     "in_tenugui_conv.csv", "in_tenugui_diff.csv"]
     log = (out_dir / "in_tenugui.log").read_text(encoding="utf-8")
     assert "C111" in log and "[変換前後チェック] OK" in log and "sha256-12" in log
     assert (out_dir / "in_tenugui.csv").read_text(encoding="utf-8-sig").splitlines()[1].endswith(",100,5")
@@ -106,7 +109,7 @@ def test_default_output_goes_to_tenugui_out_next_to_input_and_is_created(work, c
 
 def test_out_dir_option_timestamp_and_no_diff(work, capsys):
     code, out = run(capsys, "convert", work / "data" / "in.csv", "-c", work / "r.toml", "--out-dir",
-                    work / "deep" / "x", "--timestamp", "--no-diff", "--format", "json")
+                    work / "deep" / "x", "--timestamp", "--no-diff", "--detail-files", "--format", "json")
     d = json.loads(out)
     files = d["files"]
     assert "diff" not in files and Path(files["output"]).parent == work / "deep" / "x"
@@ -164,7 +167,7 @@ def test_ui_model_outputs_folder_verification_and_row_view(work):
     inp = str(work / "data" / "in.csv")
     assert m.default_output(inp).endswith("tenugui_out/in_tenugui.csv") or m.default_output(inp).endswith("tenugui_out\\in_tenugui.csv")
     lines = m.convert(inp, str(work / "r.toml"), "", False)
-    assert (work / "data" / "tenugui_out" / "in_tenugui.log").exists()
+    assert (work / "data" / "tenugui_out" / "in_tenugui.html").exists()
     assert "前後チェック: OK" in lines[3]
     view = m.row_view(1)
     assert any("＋ n: '100'" in x for x in view)

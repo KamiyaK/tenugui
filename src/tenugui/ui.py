@@ -65,7 +65,7 @@ class Model:
                  f"値が変わったセル {len(self.changes)} 件（「変更」タブ）",
                  f"変換前後チェック: {'OK' if self.verification['ok'] else 'NG'}"
                  f"（違反 {s['violations']} / 欠落 {s['lost_cells']}）→「前後チェック」タブ",
-                 f"出力フォルダ: {self.out_dir}（変換結果・変換レポート・差分・ログ）"]
+                 f"出力フォルダ: {self.out_dir}（変換結果CSV・HTMLレポート・JSONレポート）"]
         for b in r["not_idempotent"]:
             lines.append(f"注意 L102 再実行で値が変わる列 {b['column']}: {b['first']!r} → {b['second']!r}")
         return lines

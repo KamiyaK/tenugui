@@ -26,7 +26,7 @@ ROWS = [["a", "330±15mm"], ["b", "330mm"], ["c", "330～345mm"], ["d", "NG"], [
 # ---- 形 -----------------------------------------------------------------
 @pytest.mark.parametrize("raw,shape", [
     ("330±15mm", "#±#mm"), ("３３０±１５ｍｍ", "#±#mm"), ("1250W±100W(11.5～13.5A)", "#W±#W(#~#A)"),
-    ("φ13±0.2", "φ#±#"), ("1,200V", "#V"), ("標準", "標準"), ("7  mm", "# mm")])
+    ("φ13±0.2", "φ#±#"), ("1,200V", "#,#V"), ("標準", "標準"), ("7  mm", "# mm")])
 def test_shape_of(raw, shape):
     assert shape_of(raw) == shape
 
@@ -260,7 +260,7 @@ def test_cli_convert_groups_and_coverage(files, capsys):
     assert j["issues"] == [] and j["issues_truncated"]
     assert [(g["code"], g["shape"], g["count"]) for g in j["issue_groups"]] == [("C111", "#~#mm", 2)]
     assert j["case_coverage"][0]["unmatched"] == 2
-    assert "問題の内訳" in open(j["files"]["log"], encoding="utf-8").read()
+    assert sorted(j["files"]) == ["html", "json", "output"]
 
 
 def test_cli_survey_overview_suggest_impact_compare(files, capsys, tmp_path):

@@ -22,6 +22,8 @@ HINTS = {
     "C103": "未定義の単位か次元違い。[units.*] / [unit_alias] に追加するか、to を見直す",
     "C104": "strip_units に無い単位。単位を換算するなら to、捨ててよいなら strip_units に足す",
     "C111": "書式が外れた。tenugui suggest で追加すべき case の案を得るか、tenugui try で値を試す",
+    "C131": "変換はできたが形が少数派（単位なし・桁区切り・書き方違いなど）。正しければそのままでよい。"
+            "別の書式なら case を足す。警告が不要なら [settings] rare_shape = 0",
     "C121": "同義語表に無い値。[synonyms.*] に追加するか on_unknown を見直す（survey の candidates 参照）",
     "C201": "必須項目が空。入力データの欠落か、match の該当部分が無い",
     "C301": "派生の入力が数値として読めない。上流の field で数値化する",
@@ -615,7 +617,7 @@ def write_log(path: str | Path, info: dict) -> None:
               for x in v["violations"][:200]]
     for d in (v or {}).get("dropped_columns", []):
         L.append(f"削除した元の列: {d['column']}"
-                 + (f"（変換に失敗した行 {d['failed_rows']} 件。元の値は *_conv.csv の raw に記録）"
+                 + (f"（変換に失敗した行 {d['failed_rows']} 件。元の値はレポートの問題一覧 raw に記録）"
                     if d["failed_rows"] else ""))
     for b in info.get("not_idempotent", []):
         L.append(f"注意 L102 再実行で値が変わる列 {b['column']}: {b['first']!r} → {b['second']!r}")
@@ -672,23 +674,20 @@ def _write_diff(path: Path, changes: list[dict], enc: str) -> None:
 
 def convert_to_files(cfg: Config, config_path: str, input_path: str, header: list[str],
                      rows: list[list[str]], out: Path, *, no_diff: bool = False,
-                     verify: bool = False, command: str = "") -> dict:
-    """変換して 出力CSV・変換レポート・差分・ログ を out と同じフォルダに書く。印字はしない。"""
+                     verify: bool = False, command: str = "", detail_files: bool = False) -> dict:
+    """変換して、出力CSV・HTMLレポート（人が見る）・JSONレポート（機械が読む）を out と同じフォルダに書く。
+    detail_files=True で、従来の 変換レポートCSV・差分CSV・ログ も書く。印字はしない。"""
+    from . import __version__
     from .core import write_csv, write_report
+    from .report import build_report, render_html, write_json
     uh, dups = uniquify(header)
     drift = header_drift(config_path, header) if config_path else None
     out_header, out_rows, issues = convert_rows(cfg, header, rows)
     out.parent.mkdir(parents=True, exist_ok=True)
     write_csv(out, out_header, out_rows, cfg.encoding_out)
-    rep = out.with_name(out.stem + "_conv.csv")
-    write_report(rep, issues, cfg.encoding_out)
-    logp = out.with_suffix(".log")
-    files = {"output": str(out), "report": str(rep), "log": str(logp)}
+    htmlp, jsonp = out.with_suffix(".html"), out.with_suffix(".json")
+    files = {"output": str(out), "html": str(htmlp), "json": str(jsonp)}
     changes = diff_changes(header, rows, out_header, out_rows)
-    if not no_diff:
-        dp = out.with_name(out.stem + "_diff.csv")
-        _write_diff(dp, changes, cfg.encoding_out)
-        files["diff"] = str(dp)
     ver = verify_before_after(cfg, header, rows, out_header, out_rows, issues)
     idem = idempotency_report(cfg, header, rows) if verify else []
     idicts = [issue_dict(i) for i in issues]
@@ -696,12 +695,29 @@ def convert_to_files(cfg: Config, config_path: str, input_path: str, header: lis
     sha = ""
     if config_path and Path(config_path).exists():
         sha = hashlib.sha256(Path(config_path).read_bytes()).hexdigest()[:12]
-    write_log(logp, {"command": command, "input": input_path, "config": config_path or "(設定なし)",
-                     "config_sha": sha, "header_sha": header_sha(uh), "rows": len(out_rows),
-                     "errors": e, "warnings": len(issues) - e, "files": files, "verification": ver,
-                     "not_idempotent": idem, "lint": lint(cfg), "drift": drift, "issues": idicts,
-                     "groups": group_issues(issues), "coverage": case_coverage(cfg, header, rows)})
+    groups, cover = group_issues(issues), case_coverage(cfg, header, rows)
+    if detail_files:
+        rep = out.with_name(out.stem + "_conv.csv")
+        write_report(rep, issues, cfg.encoding_out)
+        files["report"] = str(rep)
+        if not no_diff:
+            dp = out.with_name(out.stem + "_diff.csv")
+            _write_diff(dp, changes, cfg.encoding_out)
+            files["diff"] = str(dp)
+        files["log"] = str(out.with_suffix(".log"))
+        write_log(files["log"], {"command": command, "input": input_path, "config": config_path or "(設定なし)",
+                                 "config_sha": sha, "header_sha": header_sha(uh), "rows": len(out_rows),
+                                 "errors": e, "warnings": len(issues) - e, "files": files, "verification": ver,
+                                 "not_idempotent": idem, "lint": lint(cfg), "drift": drift, "issues": idicts,
+                                 "groups": groups, "coverage": cover})
+    report = build_report(version=__version__, command=command, input_path=input_path,
+                          config_path=config_path or "(設定なし)", config_sha=sha, header_sha=header_sha(uh),
+                          rows=len(out_rows), errors=e, warnings=len(issues) - e, files=files, groups=groups,
+                          coverage=cover, issues=idicts, changes=changes, verification=ver,
+                          not_idempotent=idem, lint=lint(cfg), drift=drift)
+    write_json(jsonp, report)
+    htmlp.write_text(render_html(report, cfg, header, rows, out_header, out_rows, issues), encoding="utf-8")
     return {"out_header": out_header, "out_rows": out_rows, "issues": issues, "idicts": idicts,
             "changes": changes, "verification": ver, "not_idempotent": idem, "drift": drift,
             "files": files, "errors": e, "warnings": len(issues) - e, "duplicates": dups,
-            "header_sha": header_sha(uh)}
+            "header_sha": header_sha(uh), "groups": groups, "coverage": cover}
