@@ -158,7 +158,7 @@ def run_cli(capsys, *argv):
 
 
 def test_cli_convert_json_diff_and_exit_codes(files, capsys):
-    base = ["convert", files / "in.csv", "-c", files / "r.toml", "-o", files / "out.csv", "--format", "json", "--diff"]
+    base = ["convert", files / "in.csv", "-c", files / "r.toml", "-o", files / "out.csv", "--format", "json", "--detail-files"]
     code, out = run_cli(capsys, *base)
     d = json.loads(out)
     assert code == 0 and d["schema"] == "tenugui.convert/1" and d["counts"] == {"error": 1, "warning": 0}

@@ -106,7 +106,7 @@ def work(tmp_path):
 
 
 def test_dropped_columns_are_reported_with_failed_rows_and_not_a_violation(work, capsys):
-    code = main(["convert", str(work / "in.csv"), "-c", str(work / "r.toml"), "--format", "json"])
+    code = main(["convert", str(work / "in.csv"), "-c", str(work / "r.toml"), "--format", "json", "--detail-files"])
     d = json.loads(capsys.readouterr().out)
     v = d["verification"]
     assert v["ok"] and v["summary"]["violations"] == 0                       # 意図した削除は違反にしない

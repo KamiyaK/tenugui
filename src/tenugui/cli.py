@@ -133,16 +133,16 @@ def cmd_convert(args) -> int:
         return 2
     out = resolve_output(args.input, args.output, args.out_dir, args.timestamp)
     r = convert_to_files(cfg, args.config, args.input, header, rows, out, no_diff=args.no_diff,
-                         verify=args.verify, command="tenugui " + " ".join(sys.argv[1:]))
+                         verify=args.verify, command="tenugui " + " ".join(sys.argv[1:]),
+                         detail_files=args.detail_files)
     out_rows, issues, changes, ver, idem = r["out_rows"], r["issues"], r["changes"], r["verification"], r["not_idempotent"]
-    drift, files, logp, rep = r["drift"], r["files"], r["files"]["log"], r["files"]["report"]
+    drift, files = r["drift"], r["files"]
     e, w = r["errors"], r["warnings"]
     nviol = len(ver["violations"])
     nwarn = w + len(idem) + (1 if drift and drift["changed"] else 0)
     bad = _failing("error" if args.strict and args.fail_on == "none" else args.fail_on, e + nviol, nwarn)
     idicts = r["idicts"]
-    groups = group_issues(issues)
-    cover = case_coverage(cfg, header, rows)
+    groups, cover = r["groups"], r["coverage"]
     if args.format == "json":
         shown = idicts if args.max_issues < 0 else idicts[:args.max_issues]
         _json({"schema": SCHEMA.format("convert"), "ok": not bad, "input": args.input, "rows": len(out_rows),
@@ -158,16 +158,19 @@ def cmd_convert(args) -> int:
         for d in dups:
             print(f"注意: 列名 {d!r} が重複していたため #2, #3... を付けました")
         print(f"{len(out_rows)} 行を変換 → {files['output']}")
-        print(f"エラー {e} 件 / 警告 {w} 件 → {rep}")
+        print(f"エラー {e} 件 / 警告 {w} 件")
         _print_groups(groups)
         for c in cover:
             print(f"  書式の内訳 {c['column']}: "
                   + " / ".join(f"{x['label']} {x['count']}件" for x in c["cases"])
                   + f" / 不一致 {c['unmatched']}件")
-        print(f"値が変わったセル {len(changes)} 件" + ("" if args.no_diff else f" → {files['diff']}"))
+        print(f"値が変わったセル {len(changes)} 件")
         s = ver["summary"]
         print(f"変換前後チェック: {'OK' if ver['ok'] else 'NG'}（違反 {s['violations']} / 欠落 {s['lost_cells']}）")
-        print(f"ログ → {logp}")
+        print(f"レポート → {files['html']}（機械用: {Path(files['json']).name}）")
+        for k in ("report", "diff", "log"):
+            if k in files:
+                print(f"  {k} → {files[k]}")
         for v in ver["violations"][:5]:
             print(f"  違反 {v['kind']} {v['column']} {v['row']}行: {v['before']!r} → {v['after']!r}")
         for b in idem:
@@ -390,16 +393,21 @@ def main(argv: list[str] | None = None) -> int:
             st.reconfigure(encoding="utf-8")
         except Exception:
             pass
-    ap = argparse.ArgumentParser(prog="tenugui", description="chozu出力CSVの変換（表記ゆれ・単位・計算）")
+    from . import __version__
+    ap = argparse.ArgumentParser(prog="tenugui",
+                                 description=f"tenugui {__version__} — chozu出力CSVの変換（表記ゆれ・単位・計算）")
+    ap.add_argument("-V", "--version", action="version", version=f"tenugui {__version__}")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    c = sub.add_parser("convert", help="変換して出力CSVと変換レポートを書く")
+    c = sub.add_parser("convert", help="変換して 出力CSV・HTMLレポート・JSONレポート を書く")
     c.add_argument("input")
     c.add_argument("-c", "--config", required=True)
     c.add_argument("-o", "--output", help="出力CSV名（既定: 入力CSVのあるフォルダの tenugui_out/<入力名>_tenugui.csv）")
     c.add_argument("--out-dir", help=f"出力フォルダ（既定: 入力CSVのあるフォルダの {OUT_DIR_NAME}/。無ければ作る）")
     c.add_argument("--timestamp", action="store_true", help="出力ファイル名に日時を付ける")
-    c.add_argument("--no-diff", action="store_true", help="*_diff.csv を出さない")
+    c.add_argument("--detail-files", action="store_true",
+                   help="従来の *_conv.csv（問題一覧）・*_diff.csv（変更セル）・*.log も書く（同じ内容は JSON レポートにある）")
+    c.add_argument("--no-diff", action="store_true", help="--detail-files のとき *_diff.csv を出さない")
     c.add_argument("--diff", action="store_true", help=argparse.SUPPRESS)   # 互換（既定で出力する）
     c.add_argument("--verify", action="store_true", help="変換結果を再度通して値が変わる列を検出（冪等性）")
     c.add_argument("--strict", action="store_true", help="--fail-on error と同じ（互換）")

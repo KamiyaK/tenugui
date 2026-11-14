@@ -18,7 +18,8 @@ from .units import (UnitError, UnitTable, fold_key, format_decimal,
 
 SCHEMA_VERSION = 1
 
-_SETTINGS_KEYS = {"encoding_in", "encoding_out", "passthrough", "keep", "reserved", "on_error"}
+_SETTINGS_KEYS = {"encoding_in", "encoding_out", "passthrough", "keep", "reserved", "on_error", "rare_shape"}
+RARE_SHAPE_MIN_ROWS = 20      # 少数派の形(C131)を調べるのに必要な、値のある行数
 _FIELD_KEYS = {"src", "out", "drop_src", "required", "sub", "synonyms", "on_unknown",
                "extract", "number_only", "strip_units", "to", "default_unit", "unit_out", "unit_label", "decimals",
                "trim"}
@@ -55,8 +56,7 @@ PRESETS: dict[str, tuple[str, dict[str, list[str]]]] = {
 def shape_of(text: str) -> str:
     """値の「形」。数値を # に置き換えたもの（330±15mm → #±#mm）。ばらつきの把握と pattern の元になる。"""
     t = re.sub(r"\s+", " ", normalize_text(text))
-    t = re.sub(r"(?<=\d),(?=\d{3}(?!\d))", "", t)
-    return re.sub(r"\d+(?:\.\d+)?", "#", t)
+    return re.sub(r"\d+(?:\.\d+)?", "#", t)      # 桁区切りのカンマは残す（1,200V → #,#V）。読み違いに気づけるように
 
 
 _PAT_UNIT = re.compile(r"[^\s±+\-/()~〜\d.,\[\]#{}]+")
@@ -205,6 +205,7 @@ class Config:
     reserved: list[re.Pattern] = field(default_factory=list)
     on_error: str = "keep"
     tests: list[dict] = field(default_factory=list)   # [[test]]: {name, in, out, codes}
+    rare_shape: float = 0.05     # 列の中でこの割合以下の形は「少数派」として C131 警告。0 で無効
 
 
 def _unknown(prefix: str, d: dict, allowed: set[str], problems: list[str]) -> None:
@@ -365,6 +366,10 @@ def config_from_dict(raw: dict) -> Config:
     on_error = st.get("on_error", "keep")
     if on_error not in ("keep", "empty"):
         p.append("[settings] on_error は keep / empty")
+    rare = st.get("rare_shape", 0.05)
+    if isinstance(rare, bool) or not isinstance(rare, (int, float)) or not 0 <= rare < 0.5:
+        p.append("[settings] rare_shape は 0 以上 0.5 未満の数（0 で無効。既定 0.05）")
+        rare = 0.05
     reserved = []
     for pat in st.get("reserved", [r"^NG\d*$"]):
         try:
@@ -520,7 +525,7 @@ def config_from_dict(raw: dict) -> Config:
 
     if p:
         raise ConfigError(p)
-    return Config(tests=tests, units=units, fields=fields, derives=derives, synonyms=synonyms,
+    return Config(rare_shape=float(rare), tests=tests, units=units, fields=fields, derives=derives, synonyms=synonyms,
                   encoding_in=st.get("encoding_in", "utf-8-sig"),
                   encoding_out=st.get("encoding_out", "utf-8-sig"),
                   passthrough=bool(st.get("passthrough", True)),
@@ -819,9 +824,13 @@ def convert_rows(cfg: Config, header: list[str], rows: Iterable[list[str]]
     plan = plan_columns(cfg, uh)
     issues: list[Issue] = []
     out_rows: list[list[str]] = []
+    watch = _rare_shape_columns(cfg) if cfg.rare_shape > 0 else []
+    seen_raw: dict[str, list[tuple[int, str, str]]] = {c: [] for c in watch if c in idx}
     for n, row in enumerate(rows, start=1):
         row = list(row) + [""] * (len(uh) - len(row))
         vals = {h: row[i] for h, i in idx.items()}
+        for c in seen_raw:
+            seen_raw[c].append((n, row[0] if row else "", row[idx[c]]))
         nums: dict[str, tuple[Decimal | None, str | None]] = {}
         ctx = (n, vals.get(uh[0], "") if uh else "")
         for fr in cfg.fields:
@@ -831,7 +840,41 @@ def convert_rows(cfg: Config, header: list[str], rows: Iterable[list[str]]
         for dr in cfg.derives:
             vals[dr.out] = _apply_derive(cfg, dr, vals, nums, ctx, issues)
         out_rows.append([vals.get(c, "") for c in plan])
-    return plan, out_rows, dedupe_issues(issues)
+    issues = dedupe_issues(issues)
+    return plan, out_rows, issues + _rare_shape_issues(cfg, seen_raw, issues)
+
+
+def _rare_shape_columns(cfg: Config) -> list[str]:
+    """少数派の形を調べる列: 数値として読む通常の field と preset。
+    pattern / match / case は形を明示しているので対象外。"""
+    cols: list[str] = []
+    for fr in cfg.fields:
+        if fr.case_rx or not (fr.to or fr.number_only):
+            continue
+        if fr.extract is not None and not fr.label.startswith("preset:"):
+            continue
+        if fr.src not in cols:
+            cols.append(fr.src)
+    return cols
+
+
+def _rare_shape_issues(cfg: Config, seen_raw: dict, issues: list[Issue]) -> list[Issue]:
+    """変換はできたが、その列では少数派の形の値（330 だけ単位なし、など）を警告する。誤変換の見落とし防止。"""
+    bad = {(i.row, i.column) for i in issues}
+    out: list[Issue] = []
+    for col, cells in seen_raw.items():
+        live = [(n, k, raw, shape_of(raw)) for n, k, raw in cells
+                if normalize_text(raw) and not _is_reserved(cfg, raw)]
+        if len(live) < RARE_SHAPE_MIN_ROWS:
+            continue
+        cnt = Counter(x[3] for x in live)
+        main = cnt.most_common(1)[0][0]
+        for n, k, raw, sh in live:
+            if sh != main and cnt[sh] / len(live) <= cfg.rare_shape and (n, col) not in bad:
+                out.append(Issue(n, k, col, "C131", "W",
+                                 f"この列では少数派の形です（形 {sh}: {cnt[sh]}/{len(live)} 件。主な形は {main}）。"
+                                 "変換はしました。意図どおりか確認してください", raw))
+    return out
 
 
 # ---------------------------------------------------------------- 入出力
