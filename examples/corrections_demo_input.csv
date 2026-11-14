@@ -1,0 +1,7 @@
+sheet,shape_type,outer_dia,test_volt,note
+P001,標準型,35mm,100V,
+P002,STD,35nm,100V,
+P003,標準タイプ,3.5cm,100/200V,
+P004,特殊,35,200V,確認済み
+P005,SP,35mm,200V,
+P006,特殊型,35mm,NG1,

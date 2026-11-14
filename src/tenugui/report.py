@@ -190,7 +190,7 @@ def render_html(rep: dict, cfg: Config, header: list[str], rows: list[list[str]]
         P.append("<h2>問題の内訳（列 × コード × 形）</h2><div class='wrap'><table><thead><tr><th>件数</th><th>コード</th>"
                  "<th>列</th><th>形</th><th>例</th><th>行</th><th>直し方</th></tr></thead><tbody>")
         for g in rep["issue_groups"]:
-            cls = "err" if g["severity"] == "E" else "warn"
+            cls = "err" if g["severity"] == "E" else ("hold" if g["code"] == "C141" else "warn")
             col = g["column"] + (f" → {g['out']}" if g["out"] and g["out"] != g["column"] else "")
             P.append(f"<tr><td class='num'>{g['count']}</td><td class='{cls}'>{_e(g['code'])}</td><td>{_e(col)}</td>"
                      f"<td><code>{_e(g['shape'])}</code></td><td>{_e(' / '.join(g['examples']))}</td>"
@@ -230,7 +230,7 @@ def render_html(rep: dict, cfg: Config, header: list[str], rows: list[list[str]]
     P.append("<h2>変換前後（ルールのかかった列）</h2>")
     P.append("<p class='legend'><span style='background:var(--err)'>エラー（変換できず）</span>"
              "<span style='background:var(--warn)'>警告（要確認）</span>"
-             "<span style='background:var(--chg)'>値を変換した（表記統一）</span>"
+             f"<span style='background:var(--chg)'>値を変換した{'（表記統一・単位）' if pv['corrections_file'] else ''}</span>"
              + ("<span style='background:var(--cor)'>訂正（誤記を直して変換）</span>"
                 "<span style='background:var(--hold)'>保留（変換していない）</span>" if pv["corrections_file"] else "") +
              "<span style='background:var(--ng)'>抽出NG印（そのまま）</span>"

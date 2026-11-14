@@ -1,0 +1,36 @@
+# 訂正・保留の例。ルール（このファイル）は「意味を変えない言い換え」だけを書く。
+# 元データそのものの問題は corrections_demo.corrections.toml に分けて書く（同じ場所にあれば自動で読む）。
+#   tenugui convert examples/corrections_demo_input.csv -c examples/corrections_demo.toml
+#   tenugui glossary -c examples/corrections_demo.toml examples/corrections_demo_input.csv
+schema_version = 1
+
+[synonyms.shape]
+"標準型" = ["標準", "STD", "標準タイプ"]
+"特殊型" = ["特殊", "SP", "特殊タイプ"]
+
+[[field]]
+src = "shape_type"
+synonyms = "shape"
+on_unknown = "error"
+
+[[field]]
+src = "outer_dia"
+out = "outer_dia_mm"
+to = "mm"
+default_unit = "mm"
+
+[[field]]
+src = "test_volt"
+out = "test_volt_v"
+to = "V"
+
+[[test]]
+name = "訂正: nm は mm の誤記"
+in = { outer_dia = "35nm" }
+out = { outer_dia = "35mm", outer_dia_mm = "35" }
+
+[[test]]
+name = "保留: 変換せず元の値のまま"
+in = { test_volt = "100/200V" }
+out = { test_volt = "100/200V", test_volt_v = "" }
+codes = ["C141"]
