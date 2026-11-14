@@ -81,6 +81,10 @@ class Model:
         lines = [f"{len(self.out_rows)} 行を変換 → {out}",
                  f"エラー {r['errors']} 件 / 警告 {r['warnings']} 件"
                  + (f"（{len(self.groups)} 種類 →「内訳と修正案」タブ）" if self.groups else ""),
+                 *([f"訂正 {r['provenance']['counts']['correct']} セル / 保留 {r['provenance']['counts']['hold']} セル"
+                    f"（修正依頼リスト: {Path(r['files']['fix']).name}。内容は HTML レポートにも出ます）"]
+                   + [f"注意 {u['code']} {u['where']}: {u['message']}" for u in r["provenance"]["unused"]]
+                   if r["provenance"]["corrections_file"] else []),
                  f"値が変わったセル {len(self.changes)} 件（「変更」タブ）",
                  f"変換前後チェック: {'OK' if self.verification['ok'] else 'NG'}"
                  f"（違反 {s['violations']} / 欠落 {s['lost_cells']}）→「前後チェック」タブ",

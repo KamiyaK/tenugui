@@ -259,7 +259,7 @@ def render_html(rep: dict, cfg: Config, header: list[str], rows: list[list[str]]
             m = marks.get((n, col))
             if m:
                 cls = "err" if m[0] == "E" else ("hold" if m[2] == ["C141"] else "warn")
-                tags = "".join(f"<span class='tag'>{_e(x)}</span>" for x in m[2])
+                tags = "".join(f"<span class='tag'>{_e('保留' if x == 'C141' else x)}</span>" for x in m[2])
                 return f"<td class='{cls}' title='{_e(' / '.join(m[1]))}'>{_e(text)}{tags}</td>"
             return f"<td{f' class={base!r}' if base else ''}>{_e(text)}</td>"
 

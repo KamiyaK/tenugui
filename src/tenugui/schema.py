@@ -89,6 +89,18 @@ TEST = {
     "codes": K("string[]", "期待する報告コードの集合。省略時は「問題なし」を期待", []),
 }
 
+CORRECT = {
+    "column": K("string", "入力の列名", required=True),
+    "value": K("string", "元の値。完全一致（全角半角・前後の空白の違いは無視）", required=True),
+    "to": K("string", "訂正後の値。この値を通常のルールにかける", required=True),
+    "reason": K("string", "理由。なぜ誤記と言えるか（修正依頼リストにそのまま出る）", required=True),
+    "key": K("string | string[]", "先頭列（シート名など）がこの値の行だけに絞る。省略すると列の全行。"
+                                  "同じ値に key 付きと key なしがあれば key 付きが優先"),
+    "ref": K("string", "根拠・照会先（図面番号、誰にいつ聞いたか）"),
+}
+HOLD = {k: v for k, v in CORRECT.items() if k != "to"} | {
+    "reason": K("string", "理由。何が判断できないのか（修正依頼リストにそのまま出る）", required=True)}
+
 CODES = {
     "C001": ("E", "設定が参照する列が入力に無い"), "C002": ("E", "出力列名が既存の列と衝突"),
     "C003": ("W", "前回(lock)から入力の列構成が変わった"),
@@ -96,12 +108,15 @@ CODES = {
     "C103": ("E", "未定義の単位、または次元が違って換算できない"), "C104": ("E", "strip_units に無い単位"),
     "C111": ("E", "preset / pattern / match / extract / case に一致しない"),
     "C121": ("W/E", "同義語表に無い値"), "C131": ("W", "変換はできたが、列の中で少数派の形"),
+    "C141": ("W", "保留（訂正ファイルの [[hold]]）。変換せず元の値のまま通した"),
     "C201": ("E", "必須項目が空"),
     "C301": ("E", "派生: 入力が数値として読めない"), "C302": ("W", "派生: 入力が抽出NG印"),
     "C303": ("E", "派生: 計算できない"), "C304": ("W", "派生: 単位が無いので vars の単位とみなした"),
     "C305": ("E", "派生: 換算できない"), "C311": ("E", "派生: 単位付きの値に @単位 の指定が無い"),
     "L101": ("W", "再実行すると C102 になる設定"), "L102": ("W", "再実行すると値が変わる列"),
     "L201": ("W", "使われていない同義語表"),
+    "L301": ("W", "当たらなかった訂正（元データが直った、または列名・値の書き間違い）"),
+    "L302": ("W", "当たらなかった保留"), "L303": ("W", "訂正・保留の列が入力に無い（check）"),
 }
 
 
@@ -138,12 +153,26 @@ def schema() -> dict:
             "derive": {"table": "[[derive]]", "desc": "他の列から計算する列。宣言順に評価する", "keys": DERIVE},
             "test": {"table": "[[test]]", "desc": "入力 → 期待値。check と test が実行する", "keys": TEST},
         },
+        "corrections": {
+            "file": "<ルール名>.corrections.toml（ルールTOMLと同じ場所にあれば自動で読む。--corrections で指定もできる）",
+            "desc": "元データそのものの問題を、ルールTOMLとは別のファイルに書く。ルールより前に処理する。"
+                    "表記ゆれ（意味が同じ言い換え）はここではなく [synonyms.*] / case に書く",
+            "schema_version": K("int", "必須。常に 1", required=True),
+            "correct": {"table": "[[correct]]", "desc": "訂正: 正解が自明な誤記。値を置き換えてからルールにかける", "keys": CORRECT},
+            "hold": {"table": "[[hold]]", "desc": "保留: 判断が要る値。変換せず元の値のまま通し、C141 で報告する。"
+                                                 "別名の出力列と派生は空になる", "keys": HOLD},
+            "choose": ["意味が同じ言い換え・単位や書式の違い → ルールTOML（synonyms / pattern / case）",
+                       "誤記で、正しい値が元データだけから言い切れる → [[correct]]",
+                       "2通りに読める・設計者に聞かないと決まらない → [[hold]]（推測で直さない）",
+                       "値そのものの設計上の誤り → tenugui では直さない（検査は後段のチェッカーの仕事）"],
+        },
         "presets": {name: {"parts": list(order)} for name, (_, order) in PRESETS.items()},
         "preset_examples": {"tolerance": ["100±5V", "100V±5V", "100+5/-3V", "φ13±0.2", "100V"],
                             "tolerance_range": ["1250W±100W(11.5~13.5A)", "1250W(11.5~13.5A)"],
                             "range": ["11.5~13.5A", "5A~10A"]},
         "codes": {c: {"severity": sev, "meaning": m, "hint": HINTS.get(c, "")} for c, (sev, m) in CODES.items()},
-        "notes": ["正規表現（match / extract / sub / reserved）は全角半角を統一した後の文字に対して書く。TOML では '...' で書く",
+        "notes": ["訂正・保留は corrections を参照。黙って直さない: 訂正には必ず理由を書き、迷う値は保留にする",
+                  "正規表現（match / extract / sub / reserved）は全角半角を統一した後の文字に対して書く。TOML では '...' で書く",
                   "{ ... } のインラインテーブルは1行で書く。長くなるなら [field.parts.名前] の形にする",
                   "設定を書いたら tenugui check -c R IN --format json、変えたら tenugui impact で影響を確かめる"],
     }
@@ -175,6 +204,11 @@ def schema_text(s: dict) -> str:
     L += [f"処理順: {t['field']['order']}", ""]
     keys("[[derive]]", t["derive"]["keys"])
     keys("[[test]]", t["test"]["keys"])
+    c = s["corrections"]
+    L += [f"訂正ファイル {c['file']}", f"  {c['desc']}", ""]
+    keys(f"[[correct]] {c['correct']['desc']}", c["correct"]["keys"])
+    keys(f"[[hold]] {c['hold']['desc']}", c["hold"]["keys"])
+    L += ["どこに書くか", *[f"  - {x}" for x in c["choose"]], ""]
     L.append("preset と部品名")
     L += [f"  {n:16s} {', '.join(p['parts'])}    例 {' / '.join(s['preset_examples'].get(n, []))}"
           for n, p in s["presets"].items()]
