@@ -1,0 +1,232 @@
+"""値の正規化・量(数値+単位)のパースと単位換算。標準ライブラリのみ。
+
+換算は「宣言された単位表にある単位同士」だけ行う。表にない単位・次元違いは
+黙って通さず UnitError にする（静かな誤りを避ける）。
+"""
+from __future__ import annotations
+
+import re
+import unicodedata
+from decimal import Decimal, InvalidOperation
+
+__all__ = [
+    "UnitError", "UnitTable", "normalize_text", "fold_key", "parse_quantity",
+    "format_decimal", "DEFAULT_UNITS", "parse_number",
+]
+
+
+class UnitError(ValueError):
+    pass
+
+
+_MINUS = str.maketrans({"−": "-", "‐": "-", "–": "-", "ー": "-", "－": "-"})
+_NUM_UNIT = re.compile(
+    r"^(?P<num>[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)\s*(?P<unit>[^\d\s].*)?$"
+)
+
+
+def normalize_text(s: str) -> str:
+    """NFKC（全角→半角、㎜→mm、℃→°C 等）＋前後空白除去。表記ゆれの第一段。"""
+    return unicodedata.normalize("NFKC", s).strip()
+
+
+def fold_key(s: str) -> str:
+    """同義語の突き合わせ用キー。NFKC・大小無視・空白とハイフン類の除去。"""
+    t = unicodedata.normalize("NFKC", s).casefold()
+    return re.sub(r"[\s\-_・]", "", t)
+
+
+def format_decimal(d: Decimal, decimals: int | None = None, trim: bool = True) -> str:
+    if decimals is not None:
+        q = Decimal(1).scaleb(-decimals)
+        from decimal import ROUND_HALF_UP
+        d = d.quantize(q, rounding=ROUND_HALF_UP)
+    s = format(d, "f")
+    if trim and "." in s:
+        s = s.rstrip("0").rstrip(".")
+    return "0" if s in ("-0", "") else s
+
+
+# 次元 -> {"base": 基準単位, 単位: 基準単位に対する倍率}
+DEFAULT_UNITS: dict[str, dict] = {
+    "length": {"base": "mm", "mm": 1, "cm": 10, "m": 1000, "μm": "0.001", "km": 1000000},
+    "voltage": {"base": "V", "V": 1, "mV": "0.001", "kV": 1000},
+    "current": {"base": "A", "A": 1, "mA": "0.001", "μA": "0.000001", "kA": 1000},
+    "resistance": {"base": "Ω", "Ω": 1, "mΩ": "0.001", "kΩ": 1000, "MΩ": 1000000},
+    "power": {"base": "W", "W": 1, "mW": "0.001", "kW": 1000},
+    "mass": {"base": "g", "g": 1, "mg": "0.001", "kg": 1000},
+    "time": {"base": "s", "s": 1, "ms": "0.001", "min": 60, "h": 3600},
+    "pressure": {"base": "Pa", "Pa": 1, "kPa": 1000, "MPa": 1000000, "bar": 100000},
+    "frequency": {"base": "Hz", "Hz": 1, "kHz": 1000, "MHz": 1000000},
+    "ratio": {"base": "%", "%": 1, "ppm": "0.0001"},
+    # 倍率だけで換算できない単位は to_base / from_base を式で書く（変数は x）
+    "temperature": {
+        "base": "K", "K": 1,
+        "°C": {"to_base": "x + 273.15", "from_base": "x - 273.15"},
+        "°F": {"to_base": "(x - 32) * 5 / 9 + 273.15", "from_base": "(x - 273.15) * 9 / 5 + 32"},
+    },
+}
+
+# 単位の表記ゆれ（NFKC後に適用）。ユーザーの [unit_alias] で追加・上書き。
+DEFAULT_ALIASES = {
+    "ohm": "Ω", "ohms": "Ω", "Ω": "Ω", "μ": "μ",
+    "um": "μm", "uA": "μA", "v": "V", "a": "A", "w": "W", "hz": "Hz",
+    "sec": "s", "秒": "s", "分": "min", "hr": "h", "時間": "h", "度C": "°C",
+}
+
+
+class _Resolved:
+    """単位式の解決結果。scale=基準単位の積に対する倍率、sig=次元ごとの指数、affine=式定義の単位名。"""
+    __slots__ = ("scale", "sig", "affine")
+
+    def __init__(self, scale: Decimal, sig: dict[str, int], affine: str | None) -> None:
+        self.scale, self.sig, self.affine = scale, sig, affine
+
+
+def _sig_text(sig: dict[str, int]) -> str:
+    return "·".join(d if e == 1 else f"{d}^{e}" for d, e in sorted(sig.items())) or "無次元"
+
+
+_TOKEN = re.compile(r"\s*([^\s\d^*·/]+?)\s*(?:\^?\s*(-?\d+))?\s*")
+
+
+class UnitTable:
+    """単位表。線形(倍率)・式定義(to_base/from_base)・複合(mm^2, mm*mm, m/s)を扱う。"""
+
+    def __init__(self, dims: dict[str, dict] | None = None,
+                 aliases: dict[str, str] | None = None) -> None:
+        from .expr import compile_expr, ExprError
+        merged: dict[str, dict] = {k: dict(v) for k, v in DEFAULT_UNITS.items()}
+        for dim, tbl in (dims or {}).items():
+            merged.setdefault(dim, {}).update(tbl)
+        self.factors: dict[str, Decimal] = {}          # 線形単位 -> 倍率
+        self.affine: dict[str, tuple] = {}             # 式定義単位 -> (to_base, from_base)
+        self.unit_dim: dict[str, str] = {}
+        self.base: dict[str, str] = {}
+        for dim, tbl in merged.items():
+            base = tbl.get("base")
+            if not base:
+                raise UnitError(f"[units.{dim}] に base がありません")
+            for u, f in tbl.items():
+                if u == "base":
+                    continue
+                prev = self.unit_dim.get(u)
+                if prev and prev != dim:
+                    raise UnitError(f"単位 {u!r} が次元 {prev} と {dim} の両方にあります")
+                self.unit_dim[u] = dim
+                if isinstance(f, dict):
+                    try:
+                        tb, fb = compile_expr(f["to_base"]), compile_expr(f["from_base"])
+                    except KeyError as e:
+                        raise UnitError(f"[units.{dim}] {u}: to_base と from_base の両方が必要です") from e
+                    except ExprError as e:
+                        raise UnitError(f"[units.{dim}] {u}: {e}") from e
+                    if tb.names != {"x"} or fb.names != {"x"}:
+                        raise UnitError(f"[units.{dim}] {u}: 式の変数は x だけです")
+                    self.affine[u] = (tb, fb)
+                else:
+                    try:
+                        self.factors[u] = Decimal(str(f))
+                    except InvalidOperation as e:
+                        raise UnitError(f"[units.{dim}] {u} の倍率が数値ではありません: {f!r}") from e
+            if base not in self.factors:
+                raise UnitError(f"[units.{dim}] base={base!r} は倍率で定義された単位にしてください")
+            self.base[dim] = base
+        self.aliases = dict(DEFAULT_ALIASES)
+        self.aliases.update({normalize_text(k): v for k, v in (aliases or {}).items()})
+        self._cache: dict[str, _Resolved] = {}
+
+    def canon_unit(self, raw: str) -> str:
+        u = normalize_text(raw)
+        return self.aliases.get(u, u)
+
+    def resolve(self, unit: str) -> _Resolved:
+        """'mm' 'mm^2' 'mm2' 'mm*mm' 'm/s' 'kg*m/s^2' を (倍率, 次元の指数, 式定義単位) に解く。"""
+        hit = self._cache.get(unit)
+        if hit:
+            return hit
+        text = normalize_text(unit)
+        num, slash, den = text.partition("/")
+        if slash and not den.strip():
+            raise UnitError(f"単位式が不正です: {unit!r}")
+        scale, sig, atoms, aff = Decimal(1), {}, 0, None
+        for part, sign in ((num, 1), (den, -1)):
+            if not part.strip():
+                continue
+            for tok in re.split(r"[*·]", part):
+                m = _TOKEN.fullmatch(tok)
+                if not m:
+                    raise UnitError(f"単位式を読めません: {unit!r}")
+                name = self.aliases.get(m.group(1), m.group(1))
+                exp = int(m.group(2) or 1) * sign
+                dim = self.unit_dim.get(name)
+                if dim is None:
+                    raise UnitError(f"未定義の単位: {name!r}（単位式 {unit!r}）")
+                atoms += 1
+                if name in self.affine:
+                    aff = name
+                else:
+                    scale *= self.factors[name] ** exp
+                sig[dim] = sig.get(dim, 0) + exp
+        sig = {d: e for d, e in sig.items() if e != 0}
+        if aff and (atoms != 1 or sig.get(self.unit_dim[aff]) != 1):
+            raise UnitError(f"式定義の単位 {aff!r} は複合単位の中では使えません: {unit!r}")
+        r = _Resolved(scale, sig, aff)
+        self._cache[unit] = r
+        return r
+
+    def known(self, unit: str) -> bool:
+        try:
+            self.resolve(unit)
+            return True
+        except UnitError:
+            return False
+
+    def same_dim(self, a: str, b: str) -> bool:
+        return self.resolve(a).sig == self.resolve(b).sig
+
+    def convert(self, value: Decimal, src: str, dst: str) -> Decimal:
+        a, b = self.resolve(src), self.resolve(dst)
+        if a.sig != b.sig:
+            raise UnitError(f"次元が違います: {src}({_sig_text(a.sig)}) → {dst}({_sig_text(b.sig)})")
+        if src == dst:
+            return value
+        if a.affine:
+            base_val = self.affine[a.affine][0].eval({"x": value})
+        else:
+            base_val = value * a.scale
+        if b.affine:
+            return self.affine[b.affine][1].eval({"x": base_val})
+        return base_val / b.scale
+
+
+def parse_quantity(text: str, table: UnitTable) -> tuple[Decimal, str | None]:
+    """'35mm' / '１．５ cm' / '1,200V' -> (Decimal, canonical unit | None)。
+
+    数値で始まらない・数値が複数ある（φ10±0.2 など）ものは UnitError。
+    そういう複合表記は呼び出し側で regex 分割してから渡すこと。
+    """
+    t = normalize_text(text).translate(_MINUS)
+    t = re.sub(r"(?<=\d),(?=\d{3}(?!\d))", "", t)  # 桁区切り
+    m = _NUM_UNIT.match(t)
+    if not m:
+        raise UnitError(f"数値+単位として読めません: {text!r}")
+    try:
+        num = Decimal(m.group("num"))
+    except InvalidOperation as e:
+        raise UnitError(f"数値として読めません: {text!r}") from e
+    unit = m.group("unit")
+    return num, (table.canon_unit(unit) if unit else None)
+
+
+def parse_number(text: str) -> Decimal:
+    """先頭の数値だけを取り出す。後ろに何があっても（単位・注記）捨てる。換算はしない。"""
+    t = normalize_text(text).translate(_MINUS)
+    t = re.sub(r"(?<=\d),(?=\d{3}(?!\d))", "", t)
+    m = re.match(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?", t)
+    if not m:
+        raise UnitError(f"先頭が数値ではありません: {text!r}")
+    try:
+        return Decimal(m.group(0))
+    except InvalidOperation as e:
+        raise UnitError(f"数値として読めません: {text!r}") from e
