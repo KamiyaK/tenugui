@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import csv
+import difflib
 import hashlib
 import json
 import re
@@ -18,7 +19,7 @@ from .units import (UnitError, UnitTable, fold_key, format_decimal,
 
 SCHEMA_VERSION = 1
 
-_SETTINGS_KEYS = {"encoding_in", "encoding_out", "passthrough", "keep", "reserved", "on_error", "rare_shape"}
+_SETTINGS_KEYS = {"encoding_in", "encoding_out", "passthrough", "keep", "reserved", "on_error", "rare_shape", "null_values"}
 RARE_SHAPE_MIN_ROWS = 20      # 少数派の形(C131)を調べるのに必要な、値のある行数
 _FIELD_KEYS = {"src", "out", "drop_src", "required", "sub", "synonyms", "on_unknown",
                "extract", "number_only", "strip_units", "to", "default_unit", "unit_out", "unit_label", "decimals",
@@ -206,12 +207,119 @@ class Config:
     on_error: str = "keep"
     tests: list[dict] = field(default_factory=list)   # [[test]]: {name, in, out, codes}
     rare_shape: float = 0.05     # 列の中でこの割合以下の形は「少数派」として C131 警告。0 で無効
+    null_keys: frozenset = frozenset()   # 空として扱う値（[settings] null_values を NFKC・大小無視にしたもの）
 
 
 def _unknown(prefix: str, d: dict, allowed: set[str], problems: list[str]) -> None:
     for k in d:
         if k not in allowed:
-            problems.append(f"{prefix}: 未知のキー {k!r}（綴り間違い？ 使えるキー: {', '.join(sorted(allowed))}）")
+            problems.append(f"{prefix}: 未知のキー {k!r}{did_you_mean(str(k), allowed)}"
+                            f"（使えるキー: {', '.join(sorted(allowed))}）")
+
+
+def did_you_mean(word: str, candidates, n: int = 3) -> str:
+    """綴り間違いの候補。あれば「（もしかして: a, b）」、無ければ空文字。"""
+    cands = [str(c) for c in candidates]
+    low = {c.casefold(): c for c in cands}
+    hit = difflib.get_close_matches(word.casefold(), list(low), n=n, cutoff=0.6)
+    return f"（もしかして: {', '.join(low[h] for h in hit)}）" if hit else ""
+
+
+def _all_units(units: UnitTable) -> list[str]:
+    return sorted({*units.factors, *units.affine, *units.aliases})
+
+
+_PH = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+
+def _fill(text: str, env: dict[str, str], w: str, p: list[str]) -> str:
+    def sub(m):
+        if m.group(1) not in env:
+            p.append(f"{w}: {text!r} の {{{m.group(1)}}} に入れる値がありません"
+                     f"（使えるのは {', '.join('{' + k + '}' for k in env) or 'なし'}。for で定義します）")
+            return m.group(0)
+        return env[m.group(1)]
+    return _PH.sub(sub, text)
+
+
+def _expand_field(f: dict, w: str, p: list[str]) -> list[dict]:
+    """列のまとめ指定を、列ごとの [[field]] に展開する。
+      src = ["a", "b"]                         同じルールを複数の列に
+      for = { n = ["0", "1"] } + src = "w{n}"  組み合わせの数だけ展開。out にも {n} と {src} を書ける
+    あわせて each（部品共通の指定）と parts の短縮形（部品名 = "出力列名"）をほどく。"""
+    f = dict(f)
+    loop = f.pop("for", None)
+    srcs = f.get("src")
+    envs: list[dict[str, str]] = [{}]
+    if loop is not None:
+        if not isinstance(loop, dict) or not loop or not all(
+                isinstance(v, list) and v and all(isinstance(x, (str, int)) and not isinstance(x, bool) for x in v)
+                for v in loop.values()):
+            p.append(f"{w}: for は {{ n = [\"0\", \"1\"] }} のように、名前 = 値の配列 で書きます")
+            return []
+        for name, vals in loop.items():
+            if name == "src":
+                p.append(f"{w}: for の名前に src は使えません（{{src}} は元の列名を表します）")
+                return []
+            envs = [{**e, name: str(v)} for e in envs for v in vals]
+    if isinstance(srcs, list):
+        if not srcs or not all(isinstance(x, str) and x for x in srcs):
+            p.append(f"{w}: src の配列は列名の文字列だけにします")
+            return []
+        envs = [{**e, "src": _fill(x, e, w, p)} for e in envs for x in srcs]
+    elif isinstance(srcs, str):
+        envs = [{**e, "src": _fill(srcs, e, w, p)} for e in envs]
+    else:
+        p.append(f"{w}: src は列名の文字列か、その配列で書きます")
+        return []
+    if len({e["src"] for e in envs}) < len(envs):
+        p.append(f"{w}: 展開した列名が重複しています（for を使うなら src に {{名前}} を入れます）")
+        return []
+
+    def parts_of(node: dict, each, where: str):
+        if "each" in node:
+            each = node["each"]
+        if each is not None and not isinstance(each, dict):
+            p.append(f"{where}: each は {{ number_only = true, strip_units = [\"mm\"] }} の形で書きます")
+            each = None
+        ps = node.get("parts")
+        if not isinstance(ps, dict):
+            return ps
+        out = {}
+        for g, pd in ps.items():
+            if isinstance(pd, str):
+                pd = {"out": pd}                      # 短縮形: 部品名 = "出力列名"
+            out[g] = {**(each or {}), **pd} if isinstance(pd, dict) else pd
+        return out
+
+    if "each" in f and "parts" not in f and "case" not in f:
+        p.append(f"{w}: each は parts（または case）と一緒に使います。部品に共通の指定を1回で書くためのものです")
+    res = []
+    for env in envs:
+        g = {k: v for k, v in f.items() if k != "each"}
+        g["src"] = env["src"]
+        if isinstance(g.get("out"), str):
+            g["out"] = _fill(g["out"], env, w, p)
+        if "parts" in f:
+            g["parts"] = parts_of(f, None, w)
+        if isinstance(f.get("case"), list):
+            cases = []
+            for k, cs in enumerate(f["case"]):
+                if not isinstance(cs, dict):
+                    cases.append(cs)
+                    continue
+                c2 = {x: y for x, y in cs.items() if x != "each"}
+                if "parts" in cs:
+                    c2["parts"] = parts_of(cs, f.get("each"), f"{w}.case#{k + 1}")
+                cases.append(c2)
+            g["case"] = cases
+        for node in [g, *[c for c in g.get("case", []) if isinstance(c, dict)]]:
+            if isinstance(node.get("parts"), dict):
+                node["parts"] = {gn: ({**pd, "out": _fill(pd["out"], env, w, p)}
+                                      if isinstance(pd, dict) and isinstance(pd.get("out"), str) else pd)
+                                 for gn, pd in node["parts"].items()}
+        res.append(g)
+    return res
 
 
 def _mk_field(f: dict, w: str, units: UnitTable, synonyms: dict, p: list[str]) -> FieldRule | None:
@@ -225,7 +333,8 @@ def _mk_field(f: dict, w: str, units: UnitTable, synonyms: dict, p: list[str]) -
             p.append(f"{w}: sub[{j}] が不正 ({e})")
     fr.synonyms = f.get("synonyms")
     if fr.synonyms and fr.synonyms not in synonyms:
-        p.append(f"{w}: synonyms = {fr.synonyms!r} に対応する [synonyms.*] がありません")
+        p.append(f"{w}: synonyms = {fr.synonyms!r} に対応する [synonyms.*] がありません"
+                 f"{did_you_mean(fr.synonyms, synonyms)}")
     fr.on_unknown = f.get("on_unknown", "warn")
     if fr.on_unknown not in ("keep", "warn", "error"):
         p.append(f"{w}: on_unknown は keep / warn / error")
@@ -243,7 +352,8 @@ def _mk_field(f: dict, w: str, units: UnitTable, synonyms: dict, p: list[str]) -
         if u is not None:
             setattr(fr, key, units.canon_unit(u))
             if not units.known(u):
-                p.append(f"{w}: {key} = {u!r} は単位表にありません")
+                p.append(f"{w}: {key} = {u!r} は単位表にありません{did_you_mean(u, _all_units(units))}"
+                         "（新しい単位は [units.<次元>] に倍率を足すか、[unit_alias] で既存の単位の別名にします）")
     if fr.default_unit and fr.to and units.known(fr.default_unit) and units.known(fr.to) \
             and not units.same_dim(fr.default_unit, fr.to):
         p.append(f"{w}: default_unit と to の次元が違います")
@@ -284,7 +394,8 @@ def _matcher_parts(f: dict, src: str, drop: bool, w: str, units: UnitTable, syno
     if kind == "preset":
         pre = PRESETS.get(f["preset"])
         if pre is None:
-            p.append(f"{w}: preset = {f['preset']!r} は未対応（使えるもの: {', '.join(PRESETS)}）")
+            p.append(f"{w}: preset = {f['preset']!r} は未対応{did_you_mean(str(f['preset']), PRESETS)}"
+                     f"（使えるもの: {', '.join(PRESETS)}）")
             return None
         rx, unit_order, label = re.compile(pre[0]), pre[1], f"preset:{f['preset']}"
     elif kind == "pattern":
@@ -352,7 +463,8 @@ def load_config(path: str | Path) -> Config:
     except FileNotFoundError:
         raise ConfigError([f"設定ファイルが見つかりません: {path}"]) from None
     except tomllib.TOMLDecodeError as e:
-        raise ConfigError([f"TOMLの構文エラー: {e}"]) from None
+        raise ConfigError([f"TOMLの構文エラー: {e}（よくある原因: 正規表現を \"...\" で書いた → '...' で書く / "
+                           "{ } の中で改行した → 1行で書くか [field.parts.名前] の形にする / 文字列の \" の閉じ忘れ）"]) from None
     return config_from_dict(raw)
 
 
@@ -366,6 +478,10 @@ def config_from_dict(raw: dict) -> Config:
     on_error = st.get("on_error", "keep")
     if on_error not in ("keep", "empty"):
         p.append("[settings] on_error は keep / empty")
+    nulls = st.get("null_values", [])
+    if not isinstance(nulls, list) or not all(isinstance(x, str) and x.strip() for x in nulls):
+        p.append("[settings] null_values は [\"-\", \"なし\", \"未定\"] のように、空として扱う値の配列で書きます")
+        nulls = []
     rare = st.get("rare_shape", 0.05)
     if isinstance(rare, bool) or not isinstance(rare, (int, float)) or not 0 <= rare < 0.5:
         p.append("[settings] rare_shape は 0 以上 0.5 未満の数（0 で無効。既定 0.05）")
@@ -398,14 +514,17 @@ def config_from_dict(raw: dict) -> Config:
         synonyms[sname] = m
 
     fields: list[FieldRule] = []
+    expanded: list[tuple[str, dict]] = []
     for i, f in enumerate(raw.get("field", [])):
         w = f"[[field]]#{i + 1}"
-        if "src" not in f:
+        if not isinstance(f, dict) or "src" not in f:
             p.append(f"{w}: src が必要です")
             continue
-        w += f"({f['src']})"
+        for g in _expand_field(f, w, p):
+            expanded.append((f"{w}({g['src']})", g))
+    for w, f in expanded:
         if "case" in f:
-            _unknown(w, f, {"src", "case", "drop_src"}, p)
+            _unknown(w, f, {"src", "case", "drop_src"}, p)     # for / each は展開時に取り除いてある
             if not isinstance(f["case"], list) or not f["case"]:
                 p.append(f"{w}: case は [[field.case]] を1つ以上書きます")
                 continue
@@ -525,7 +644,7 @@ def config_from_dict(raw: dict) -> Config:
 
     if p:
         raise ConfigError(p)
-    return Config(rare_shape=float(rare), tests=tests, units=units, fields=fields, derives=derives, synonyms=synonyms,
+    return Config(null_keys=frozenset(null_key(x) for x in nulls), rare_shape=float(rare), tests=tests, units=units, fields=fields, derives=derives, synonyms=synonyms,
                   encoding_in=st.get("encoding_in", "utf-8-sig"),
                   encoding_out=st.get("encoding_out", "utf-8-sig"),
                   passthrough=bool(st.get("passthrough", True)),
@@ -555,7 +674,7 @@ def check_header(cfg: Config, header: list[str]) -> list[str]:
     hs = set(header)
     for fr in cfg.fields:
         if fr.src not in hs:
-            p.append(f"C001 入力に列 {fr.src!r} がありません")
+            p.append(f"C001 入力に列 {fr.src!r} がありません{did_you_mean(fr.src, header)}")
         if fr.out != fr.src and fr.out in hs:
             p.append(f"C002 out={fr.out!r} が既存の入力列と衝突します")
     produced = {fr.out for fr in cfg.fields}
@@ -564,7 +683,8 @@ def check_header(cfg: Config, header: list[str]) -> list[str]:
             p.append(f"C002 派生列 {dr.out!r} が既存の入力列と衝突します")
         for vn, (col, _) in dr.vars.items():
             if col not in hs and col not in produced:
-                p.append(f"C001 派生 {dr.out!r} の変数 {vn} が参照する列 {col!r} がありません")
+                p.append(f"C001 派生 {dr.out!r} の変数 {vn} が参照する列 {col!r} がありません"
+                         f"{did_you_mean(col, [*header, *produced])}")
         produced.add(dr.out)
         if dr.after and dr.after not in hs and dr.after not in produced:
             p.append(f"C001 派生 {dr.out!r} の after={dr.after!r} がありません")
@@ -572,6 +692,15 @@ def check_header(cfg: Config, header: list[str]) -> list[str]:
         if k not in hs:
             p.append(f"C001 keep の列 {k!r} がありません")
     return p
+
+
+def null_key(s: str) -> str:
+    return normalize_text(s).casefold()
+
+
+def is_null(cfg: Config, s: str) -> bool:
+    """[settings] null_values にある値か（「-」「なし」など、空と同じ意味の値）。"""
+    return bool(cfg.null_keys) and null_key(s) in cfg.null_keys
 
 
 def _is_reserved(cfg: Config, s: str) -> bool:
@@ -603,6 +732,9 @@ def _apply_field(cfg: Config, fr: FieldRule, raw: str, nums: dict, rowctx: tuple
     if _is_reserved(cfg, raw):
         tr("reserved", raw)
         return raw  # chozuの抽出NG印などは触らず通す
+    if is_null(cfg, raw):
+        tr("null", "空として扱う")
+        raw = ""
     if fr.case_rx:
         k = select_case(fr, raw)
         if k is None:
@@ -718,7 +850,7 @@ def _var_value(cfg: Config, col: str, unit: str | None, vals: dict, nums: dict,
     raw = vals.get(col, "")
     if _is_reserved(cfg, raw):
         return None, ("C302", f"入力 {col} が抽出NG印 {raw!r} のため計算しません")
-    if normalize_text(raw) == "":
+    if normalize_text(raw) == "" or is_null(cfg, raw):
         return None, None  # 空は空のまま伝播（報告しない）
     try:
         num, have = parse_quantity(raw, cfg.units)
@@ -864,7 +996,7 @@ def _rare_shape_issues(cfg: Config, seen_raw: dict, issues: list[Issue]) -> list
     out: list[Issue] = []
     for col, cells in seen_raw.items():
         live = [(n, k, raw, shape_of(raw)) for n, k, raw in cells
-                if normalize_text(raw) and not _is_reserved(cfg, raw)]
+                if normalize_text(raw) and not _is_reserved(cfg, raw) and not is_null(cfg, raw)]
         if len(live) < RARE_SHAPE_MIN_ROWS:
             continue
         cnt = Counter(x[3] for x in live)
