@@ -1,0 +1,66 @@
+schema_version = 1
+
+[settings]
+passthrough = true          # 書いていない列はそのまま通す
+on_error = "keep"           # 変換できない値は元の値を残し、レポートに出す
+# reserved = ['^NG\d*$']    # chozuの抽出NG印はそのまま通す（既定）
+
+# --- 単位表: 既定の表に無い単位・次元だけ書く ---------------------------
+[units.length]
+inch = "25.4"               # 1inch = 25.4mm
+
+[unit_alias]                # 単位の表記ゆれ（全角・㎜等はNFKCで自動吸収済み）
+"ミリ" = "mm"
+"ボルト" = "V"
+
+# --- 表記ゆれの同義語表: 正規名 = [ゆれの一覧] ----------------------------
+[synonyms.shape]
+"標準型" = ["標準", "STD", "標準タイプ"]
+"特殊型" = ["特殊", "SP", "特殊タイプ"]
+
+# --- 列ごとの変換 --------------------------------------------------------
+[[field]]
+src = "h_format"
+synonyms = "shape"
+on_unknown = "error"        # 同義語表に無い値は検出して止める
+
+[[field]]
+src = "qt_outer_diameter"
+to = "mm"                   # mmに換算（cm, m, inch, 全角㎜ などを吸収）
+default_unit = "mm"         # 単位が書かれていない場合はmm扱い
+unit_out = "strip"          # 出力は数値のみ（"add" なら 35mm のように付ける）
+
+[[field]]
+src = "fcp_length"
+out = "fcp_length_mm"       # out が違えば元の列は残し、直後に追加する
+to = "mm"
+default_unit = "mm"
+decimals = 1
+
+[[field]]
+src = "h_hstandard_test_volt"
+to = "V"
+default_unit = "V"
+required = true
+
+[[field]]
+src = "qt_dimension"        # "φ10±0.2" を1ルールで 基準値 と ± に分解（元の列は残る）
+match = '^[φΦ]?(?P<nom>[\d.]+)(?:±(?P<tol>[\d.]+))?$'
+parts = { nom = { out = "qt_nominal_mm", to = "mm", default_unit = "mm" }, tol = { out = "qt_tol_mm", to = "mm", default_unit = "mm" } }
+
+# --- 計算（宣言順に評価。単位は 列名@単位 で指定すると換算してから使う） ----
+[[derive]]
+out = "qt_area_mm2"
+expr = "pi * (d / 2) ** 2"
+vars = { d = "qt_outer_diameter" }
+unit = "mm2"
+decimals = 2
+after = "qt_outer_diameter"
+
+[[derive]]
+out = "fcp_length_m"
+expr = "l"                  # 単位換算だけしたいとき
+vars = { l = "fcp_length_mm@m" }  # fcp_length_mm(mm)をmに換算
+unit = "m"
+unit_out = "add"            # 出力は 0.085m のように単位付き
+decimals = 3

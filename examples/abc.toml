@@ -1,0 +1,18 @@
+schema_version = 1
+
+# 使い方1: A でも B でも C でも "A" にそろえる（表記ゆれの統一）
+#   正規名 = [ゆれの一覧]。大文字小文字・全角半角・空白・ハイフンの違いは自動で無視される
+[synonyms.grade]
+"A" = ["B", "C"]
+"標準型" = ["標準", "STD", "標準タイプ"]
+
+[[field]]
+src = "grade"
+synonyms = "grade"
+on_unknown = "warn"        # 表に無い値は警告（keep=黙って通す / error=エラー）
+
+# 使い方2: セルに "A,B,C" のように並んでいるとき、先頭の A だけにする
+[[field]]
+src = "list"
+out = "list_first"         # out を変えると元の列は残る
+extract = '^([^,、]+)'      # 最初の , か 、 の手前まで
