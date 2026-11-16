@@ -1,0 +1,44 @@
+# 連携テスト用の tenugui 設定（chozu_pipeline.toml の出力CSVにかける）
+schema_version = 1
+
+[settings]
+null_values = ["-"]
+
+[synonyms.kind]
+"標準" = ["標準型", "スタンダード"]
+"特殊" = ["特殊型"]
+
+[[field]]
+src = "kind"
+synonyms = "kind"
+
+[[field]]
+src = "width"
+to = "mm"
+
+[[field]]
+src = "length"
+drop_src = true
+each = { to = "mm", default_unit = "mm" }
+[[field.case]]
+preset = "tolerance"
+parts = { nom = "length_nom", tol = "length_tol" }
+[[field.case]]
+pattern = "{lo}~{hi}mm"
+parts = { lo = "length_min", hi = "length_max" }
+
+[[field]]
+src = "rating"
+drop_src = true
+each = { to = "W" }
+[[field.case]]
+preset = "tolerance_range"
+parts = { nom = "rating_w", tol = "rating_w_tol", rlo = { out = "rating_a_min", to = "A" }, rhi = { out = "rating_a_max", to = "A" } }
+[[field.case]]
+pattern = "{w}W+{plus}-{minus}({lo}~{hi}A)"
+parts = { w = "rating_w", plus = "rating_w_plus", minus = "rating_w_minus", lo = { out = "rating_a_min", to = "A" }, hi = { out = "rating_a_max", to = "A" } }
+
+[[field]]
+src = "test_time"
+to = "min"
+default_unit = "min"

@@ -40,6 +40,18 @@ tenugui glossary -c rules.toml [in.csv]           # 用語対応表（正式名 
 
 変更履歴は [CHANGELOG.md](CHANGELOG.md)。版は `tenugui --version` で確認できる。
 
+## 0.13.0（堅くする）
+壊れた入力・変な値・間違った設定を与える「いじわる試験」と、chozu との連携テストで見つかった不具合を直した版。
+主なもの: シート名が `#` で始まる行を黙って捨てていた／ヘッダより列の多い行の値を黙って捨てていた／設定の型違いで落ちていた／
+空白が何万個も続く値で止まっていた。詳しくは [CHANGELOG.md](CHANGELOG.md)。
+
+テストの走らせ方:
+
+```
+python -m pytest                                   # 全部（chozu が無ければ連携の一部は飛ばす）
+PYTHONPATH=src:../chozu/src python -m pytest tests/chozu_pipeline     # 本物の chozu を動かして連携を確かめる
+```
+
 ## 0.11.0 の追加（元データの問題を黙って直さない）
 
 ルールTOML には「意味を変えない言い換え」（表記ゆれ・単位）だけを書く。元データそのものの問題は、

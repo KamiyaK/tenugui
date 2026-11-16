@@ -9,18 +9,19 @@ import re
 import tomllib
 from collections import Counter
 from dataclasses import dataclass, field, replace
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Iterable
 
 from .corrections import Corrections, Provenance, corrections_path, parse_corrections, read_corrections
 from .expr import Expr, ExprError, compile_expr
-from .units import (UnitError, UnitTable, fold_key, format_decimal,
+from .units import (UnitError, UnitTable, fold_key, format_decimal, squash_ws,
                     normalize_text, parse_number, parse_quantity)
 
 SCHEMA_VERSION = 1
 
 _SETTINGS_KEYS = {"encoding_in", "encoding_out", "passthrough", "keep", "reserved", "on_error", "rare_shape", "null_values"}
+MAX_VALUE_CHARS = 2000         # これより長い値は、数値や書式として照合しない（C101 / C111）
 RARE_SHAPE_MIN_ROWS = 20      # 少数派の形(C131)を調べるのに必要な、値のある行数
 _FIELD_KEYS = {"src", "out", "drop_src", "required", "sub", "synonyms", "on_unknown",
                "extract", "number_only", "strip_units", "to", "default_unit", "unit_out", "unit_label", "decimals",
@@ -55,6 +56,11 @@ PRESETS: dict[str, tuple[str, dict[str, list[str]]]] = {
 }
 
 
+def _clip(text: str, n: int = 80) -> str:
+    """報告用に長い文字列を切る。"""
+    return text if len(text) <= n else text[:n] + f"…（{len(text)}文字）"
+
+
 def shape_of(text: str) -> str:
     """値の「形」。数値を # に置き換えたもの（330±15mm → #±#mm）。ばらつきの把握と pattern の元になる。"""
     t = re.sub(r"\s+", " ", normalize_text(text))
@@ -73,10 +79,12 @@ def compile_pattern(pattern: str) -> tuple[str, dict[str, list[str]]]:
       数値の直後の文字（mm, W など）はその数値の単位。単位のない数値は、同じ括弧区間の
       隣の数値の単位を借りる（#±#mm の1つ目は mm）。それ以外の文字はそのまま一致。空白の有無は問わない。
     """
+    if len(pattern) > 300:
+        raise ValueError(f"pattern が長すぎます（{len(pattern)}文字。上限 300）")
     t = re.sub(r"\s+", " ", normalize_text(pattern))
     out: list[str] = ["^"]
     order: list[tuple[str, int, bool]] = []      # (名前, 括弧区間, 自前の単位があるか)
-    seg, auto, i, prev_sign, depth = 0, 0, 0, False, 0
+    seg, auto, i, prev_sign, depth, last = 0, 0, 0, False, 0, ""
     while i < len(t):
         c = t[i]
         if c in "#{":
@@ -93,6 +101,10 @@ def compile_pattern(pattern: str) -> tuple[str, dict[str, list[str]]]:
                 name, i = f"n{auto}", i + 1
             if any(name == o[0] for o in order):
                 raise ValueError(f"数値の名前 {name!r} が重複しています")
+            if last == "num":
+                raise ValueError("数値が隣り合っています（## や {a}{b}）。どこで区切るか決まらないので、間に文字か空白を書いてください")
+            if last == "num_ws":
+                out[-1] = r"\s+"          # 数値 空白 数値: 空白が無いと 12 を 1 と 2 に分けてしまう
             out.append(f"(?P<{name}>{_UNS if prev_sign else _NUM})")
             m = _PAT_UNIT.match(t, i)
             if m:
@@ -100,29 +112,37 @@ def compile_pattern(pattern: str) -> tuple[str, dict[str, list[str]]]:
                 i = m.end()
             order.append((name, seg, bool(m)))
             prev_sign = False
+            last = "unit" if m else "num"
         elif c == "[":
             out.append("(?:")
             depth += 1
             i += 1
+            last = "open"
         elif c == "]":
             if depth == 0:
                 raise ValueError("] に対応する [ がありません")
+            if last == "open":
+                raise ValueError("[ ] の中が空です")
             out.append(")?")
             depth -= 1
             i += 1
+            last = "close"
         elif c == " ":
             out.append(r"\s*")
             i += 1
+            last = "num_ws" if last == "num" else last
         elif c in "~〜":
             out.append(r"\s*[~〜]\s*")
             prev_sign = False
             i += 1
+            last = "lit"
         else:
             if c in "()":
                 seg += 1
             out.append(re.escape(c) if c.isalnum() else rf"\s*{re.escape(c)}\s*")
             prev_sign = c in "±+-"
             i += 1
+            last = "lit"
     if depth:
         raise ValueError("[ が閉じていません")
     if not order:
@@ -481,8 +501,150 @@ def load_config(path: str | Path, corrections: str | Path | None = None) -> Conf
     return cfg
 
 
+def _tname(v) -> str:
+    return {bool: "true/false", int: "整数", float: "小数", str: "文字列", list: "配列", dict: "テーブル"}.get(
+        type(v), type(v).__name__)
+
+
+def _strs(v) -> bool:
+    return isinstance(v, list) and all(isinstance(x, str) for x in v)
+
+
+def _num(v) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and v == v and abs(v) != float("inf")
+
+
+_T_STR = ("文字列", lambda v: isinstance(v, str))
+_T_NAME = ("空でない文字列", lambda v: isinstance(v, str) and v.strip() != "")
+_T_BOOL = ("true / false", lambda v: isinstance(v, bool))
+_T_DEC = ("-20〜50 の整数", lambda v: isinstance(v, int) and not isinstance(v, bool) and -20 <= v <= 50)
+_T_STRS = ("文字列の配列 [\"a\", \"b\"]", _strs)
+_T_SUB = ("[[\"正規表現\", \"置換後\"], ...] の形", lambda v: isinstance(v, list) and all(
+    isinstance(x, list) and len(x) == 2 and all(isinstance(y, str) for y in x) for x in v))
+_T_TABLE = ("テーブル { ... }", lambda v: isinstance(v, dict))
+_T_STR_OR_STRS = ("文字列か、文字列の配列", lambda v: isinstance(v, str) or _strs(v))
+_T_STRMAP = ("{ 名前 = \"文字列\" } の形", lambda v: isinstance(v, dict) and all(isinstance(x, str) for x in v.values()))
+_T_TABLES = ("テーブルの配列（[[...]] で書く）", lambda v: isinstance(v, list) and all(isinstance(x, dict) for x in v))
+_VALUE_T = {"out": _T_NAME, "required": _T_BOOL, "sub": _T_SUB, "synonyms": _T_STR, "on_unknown": _T_STR,
+            "number_only": _T_BOOL, "strip_units": _T_STRS, "to": _T_NAME, "default_unit": _T_NAME,
+            "unit_out": _T_STR, "unit_label": _T_STR, "decimals": _T_DEC, "trim": _T_BOOL}
+_FIELD_T = {**_VALUE_T, "extract": _T_STR, "drop_src": _T_BOOL, "preset": _T_STR, "pattern": _T_STR,
+            "match": _T_STR, "each": _T_TABLE, "case": _T_TABLES}
+_PART_T = {**_VALUE_T, "unit_group": _T_STR_OR_STRS}
+_DERIVE_T = {"out": _T_NAME, "expr": _T_STR, "vars": _T_STRMAP, "unit": _T_NAME, "to": _T_NAME, "unit_out": _T_STR,
+             "decimals": _T_DEC, "trim": _T_BOOL, "after": _T_STR}
+_SETTINGS_T = {"encoding_in": _T_NAME, "encoding_out": _T_NAME, "passthrough": _T_BOOL, "keep": _T_STRS,
+               "reserved": _T_STRS, "on_error": _T_STR}
+
+
+def _type_problems(raw) -> list[str]:
+    """値の型が合っているか。意味の検査より先に行い、型の違う値が先へ進まないようにする。"""
+    if not isinstance(raw, dict):
+        return ["設定の最上位はテーブルです"]
+    p: list[str] = []
+
+    def chk(where: str, d: dict, spec: dict) -> None:
+        for k, v in d.items():
+            t = spec.get(k)
+            if t and not t[1](v):
+                p.append(f"{where}: {k} は {t[0]} で書きます（今は {_tname(v)}: {repr(v)[:40]}）")
+
+    def parts(where: str, node: dict) -> None:
+        if isinstance(node.get("each"), dict):
+            chk(f"{where}.each", node["each"], _VALUE_T)
+        if isinstance(node.get("parts"), dict):
+            for g, pd in node["parts"].items():
+                if isinstance(pd, dict):
+                    chk(f"{where}.parts.{g}", pd, _PART_T)
+
+    for key, kind in (("settings", dict), ("units", dict), ("unit_alias", dict), ("synonyms", dict),
+                      ("field", list), ("derive", list), ("test", list)):
+        if key in raw and not isinstance(raw[key], kind):
+            head = f"[{key}]" if kind is dict else f"[[{key}]]"
+            p.append(f"{head} は{'テーブル' if kind is dict else 'テーブルの配列'}で書きます（今は {_tname(raw[key])}）")
+    if p:
+        return p
+    chk("[settings]", raw.get("settings", {}), _SETTINGS_T)
+    for dim, tbl in raw.get("units", {}).items():
+        if not isinstance(tbl, dict):
+            p.append(f"[units.{dim}] はテーブルで書きます（base = \"基準単位\"、単位 = 倍率）")
+            continue
+        for u, f in tbl.items():
+            if u == "base":
+                ok = isinstance(f, str) and f.strip() != ""
+            elif isinstance(f, dict):
+                ok = set(f) == {"to_base", "from_base"} and all(isinstance(x, str) for x in f.values())
+            elif isinstance(f, str):            # "25.4" のように文字列で書いた倍率（小数を正確に書くための書き方）
+                try:
+                    d = Decimal(f.strip())
+                    ok = d.is_finite() and d > 0
+                except (InvalidOperation, ValueError):
+                    ok = False
+            else:
+                ok = _num(f) and f > 0
+            if not ok:
+                p.append(f"[units.{dim}] {u} は "
+                         + ("基準単位の名前（文字列）" if u == "base" else
+                            "0 より大きい数（倍率。25.4 か \"25.4\"）か { to_base = \"式\", from_base = \"式\" }")
+                         + f" で書きます（今は {_tname(f)}: {repr(f)[:40]}）")
+    for a, u in raw.get("unit_alias", {}).items():
+        if not isinstance(u, str) or not u.strip():
+            p.append(f"[unit_alias] {a} は単位名（文字列）で書きます（今は {_tname(u)}）")
+    for name, tbl in raw.get("synonyms", {}).items():
+        if not isinstance(tbl, dict):
+            p.append(f"[synonyms.{name}] は \"正しい表記\" = [\"ゆれ1\", \"ゆれ2\"] のテーブルで書きます（今は {_tname(tbl)}）")
+            continue
+        for canon, vs in tbl.items():
+            if isinstance(vs, list) and not all(isinstance(x, (str, int, float)) and not isinstance(x, bool) for x in vs):
+                p.append(f"[synonyms.{name}] {canon} の配列は文字列だけにします")
+    for i, f in enumerate(raw.get("field", [])):
+        w = f"[[field]]#{i + 1}"
+        if not isinstance(f, dict):
+            p.append(f"{w}: テーブルで書きます（今は {_tname(f)}）")
+            continue
+        chk(w, f, _FIELD_T)
+        parts(w, f)
+        if isinstance(f.get("case"), list):
+            for k, cs in enumerate(f["case"]):
+                if isinstance(cs, dict):
+                    chk(f"{w}.case#{k + 1}", cs, {k2: _FIELD_T[k2] for k2 in ("preset", "pattern", "match", "each")})
+                    parts(f"{w}.case#{k + 1}", cs)
+    for i, d in enumerate(raw.get("derive", [])):
+        if not isinstance(d, dict):
+            p.append(f"[[derive]]#{i + 1}: テーブルで書きます（今は {_tname(d)}）")
+        else:
+            chk(f"[[derive]]#{i + 1}", d, _DERIVE_T)
+    for i, t in enumerate(raw.get("test", [])):
+        if not isinstance(t, dict):
+            p.append(f"[[test]]#{i + 1}: テーブルで書きます（今は {_tname(t)}）")
+            continue
+        chk(f"[[test]]#{i + 1}", t, {"name": _T_STR})
+        for k in ("in", "out"):
+            if isinstance(t.get(k), dict) and not all(isinstance(x, (str, int, float)) and not isinstance(x, bool)
+                                                      for x in t[k].values()):
+                p.append(f"[[test]]#{i + 1}: {k} の値は文字列で書きます（\"7mm\" のように引用符で囲む）")
+        if isinstance(t.get("codes"), list) and not _strs(t["codes"]):
+            p.append(f"[[test]]#{i + 1}: codes は [\"C111\"] のように文字列の配列で書きます")
+    return p
+
+
 def config_from_dict(raw: dict, corrections: dict | None = None) -> Config:
     """corrections は訂正ファイルを読んだ辞書（[[correct]] / [[hold]]）。"""
+    tp = _type_problems(raw)
+    if tp:
+        raise ConfigError(tp)
+    try:
+        return _config_from_dict(raw, corrections)
+    except ConfigError:
+        raise
+    except (RecursionError, MemoryError) as e:
+        raise ConfigError([f"設定が大きすぎるか入れ子が深すぎて読めません（{type(e).__name__}）"]) from None
+    except Exception as e:      # 型の検査をすり抜けた想定外の形。トレースバックではなく設定エラーとして返す
+        raise ConfigError([f"設定を解釈できません（{type(e).__name__}: {str(e)[:120]}）。"
+                           "値の型（文字列・数・配列・テーブル）が違う可能性があります。tenugui schema で書き方を確認してください"]) from None
+
+
+def _config_from_dict(raw: dict, corrections: dict | None = None) -> Config:
     p: list[str] = []
     _unknown("トップレベル", raw, _TOP_KEYS, p)
     if raw.get("schema_version") != SCHEMA_VERSION:
@@ -676,11 +838,17 @@ def config_from_dict(raw: dict, corrections: dict | None = None) -> Config:
 def uniquify(header: list[str]) -> tuple[list[str], list[str]]:
     """重複する列名に #2, #3 を付けて一意化。付けた元の名前を返す。"""
     seen: Counter = Counter()
+    taken = set(header)                 # 元からある名前（"a#2" という列が実在する場合に重ねない）
     out, dups = [], []
     for h in header:
         seen[h] += 1
         if seen[h] > 1:
-            out.append(f"{h}#{seen[h]}")
+            n = seen[h]
+            while f"{h}#{n}" in taken:
+                n += 1
+            name = f"{h}#{n}"
+            taken.add(name)
+            out.append(name)
             if h not in dups:
                 dups.append(h)
         else:
@@ -692,9 +860,17 @@ def check_header(cfg: Config, header: list[str]) -> list[str]:
     """設定が入力ヘッダに対して成り立つか。問題点のリスト。"""
     p: list[str] = []
     hs = set(header)
+    loose = {fold_key(h): h for h in header}
+
+    def missing(col: str) -> str:
+        near = loose.get(fold_key(col))
+        if near is not None and near != col:
+            return f"（入力の列名は {near!r} です。空白・全角半角・大文字小文字が違います。設定の列名を入力に合わせてください）"
+        return did_you_mean(col, header)
+
     for fr in cfg.fields:
         if fr.src not in hs:
-            p.append(f"C001 入力に列 {fr.src!r} がありません{did_you_mean(fr.src, header)}")
+            p.append(f"C001 入力に列 {fr.src!r} がありません{missing(fr.src)}")
         if fr.out != fr.src and fr.out in hs:
             p.append(f"C002 out={fr.out!r} が既存の入力列と衝突します")
     produced = {fr.out for fr in cfg.fields}
@@ -732,8 +908,11 @@ def select_case(fr: FieldRule, raw: str) -> int | None:
     text = normalize_text(raw)
     if text == "":
         return None
+    if len(text) > MAX_VALUE_CHARS:
+        return -1
+    sq = squash_ws(text)
     for k, rx in enumerate(fr.case_rx):
-        if rx.search(text):
+        if rx.search(text if fr.case_labels[k] == "match" else sq):   # 利用者の正規表現にはそのまま渡す
             return k
     return -1
 
@@ -762,7 +941,7 @@ def _apply_field(cfg: Config, fr: FieldRule, raw: str, nums: dict, rowctx: tuple
         if k < 0:
             tr("case", "どの書式にも不一致")
             nums[fr.out] = (None, None)
-            issue("C111", "E", f"どの case にも一致しません（形: {shape_of(raw)}）")
+            issue("C111", "E", f"どの case にも一致しません（形: {_clip(shape_of(raw))}）")
             return "" if (cfg.on_error == "empty" or fr.out != fr.src) else raw
         tr("case", f"#{k + 1} {fr.case_labels[k]}")
         alt = fr.alts.get(k)
@@ -796,8 +975,13 @@ def _apply_field(cfg: Config, fr: FieldRule, raw: str, nums: dict, rowctx: tuple
                 return ""
     # 別名列(out != src)の失敗は空にする。元の値は src 列に残っており、別列に生の複合文字列を複製すると誤読のもと
     fail = "" if (cfg.on_error == "empty" or fr.out != fr.src) else raw
+    if (fr.extract or fr.to or fr.number_only) and len(text) > MAX_VALUE_CHARS:
+        tr("too_long", f"{len(text)}文字")
+        nums[fr.out] = (None, None)
+        issue("C101", "E", f"値が長すぎて数値として読めません（{len(text)}文字。上限 {MAX_VALUE_CHARS}）")
+        return fail
     if fr.extract:
-        m = fr.extract.search(text)
+        m = fr.extract.search(squash_ws(text) if fr.label not in ("", "match") else text)
         if not m:
             tr("extract", "不一致")
             issue("C111", "E", f"{'match' if fr.group else 'extract'} に一致しません: {fr.extract.pattern!r}")
@@ -1077,14 +1261,39 @@ def _rare_shape_issues(cfg: Config, seen_raw: dict, issues: list[Issue]) -> list
 
 # ---------------------------------------------------------------- 入出力
 
+MAX_FIELD_CHARS = 10_000_000
+
+
 def read_csv(path: str | Path, encoding: str) -> tuple[list[str], list[list[str]]]:
-    with open(path, newline="", encoding=encoding) as f:
-        r = list(csv.reader(f))
-    # chozuのCSV先頭の「# chozu:」コメント行など # 始まりは読み飛ばす
-    r = [x for x in r if x and any(c.strip() for c in x) and not x[0].startswith("#")]
+    """CSV を読む。戻り値 (ヘッダ, データ行)。行は1つも捨てない・足さない（空行を除く）。
+
+    - 先頭にある「# 」で始まるコメント行（chozu の NG 一覧の `# chozu: ...`）だけ読み飛ばす。
+      ヘッダより後ろの行は、# で始まっていてもデータ（シート名が #004 のことがある）
+    - 何も書かれていない行（改行だけ）は読み飛ばす。「,,,」のようにセルのある行は残す
+    - ヘッダより列の多い行があれば止める（はみ出した値を黙って捨てない）
+    """
+    csv.field_size_limit(MAX_FIELD_CHARS)
+    try:
+        with open(path, newline="", encoding=encoding) as f:
+            r = [x for x in csv.reader(f) if x]
+    except csv.Error as e:
+        raise ConfigError([f"{path}: CSV として読めません（{e}）。1つのセルが大きすぎるか、引用符 \" が閉じていません"]) from None
+    while r and r[0][0].startswith("# "):
+        r.pop(0)
     if not r:
         raise ConfigError([f"{path}: 空のCSVです"])
-    return r[0], r[1:]
+    header, rows = r[0], r[1:]
+    header[0] = header[0].lstrip("\ufeff")          # BOM が二重に付いたファイル
+    if len(header) == 1 and rows:
+        for sep, name in (("\t", "タブ"), (";", "セミコロン")):
+            if sep in header[0]:
+                raise ConfigError([f"{path}: 区切り文字がカンマではないようです（{name}区切り）。カンマ区切りのCSVにしてください"])
+    wide = [(n, len(x)) for n, x in enumerate(rows, start=1) if len(x) > len(header) and any(c.strip() for c in x[len(header):])]
+    if wide:
+        ex = "、".join(f"{n}行目（{k}列）" for n, k in wide[:5])
+        raise ConfigError([f"{path}: ヘッダ（{len(header)}列）より列の多い行があります: {ex}"
+                           f"{' ほか' if len(wide) > 5 else ''}。値の中のカンマが引用符で囲まれていない可能性があります"])
+    return header, rows
 
 
 def write_csv(path: str | Path, header: list[str], rows: list[list[str]], encoding: str) -> None:

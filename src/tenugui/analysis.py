@@ -25,6 +25,7 @@ HINTS = {
     "C111": "書式が外れた。tenugui suggest で追加すべき case の案を得るか、tenugui try で値を試す",
     "C131": "変換はできたが形が少数派（単位なし・桁区切り・書き方違いなど）。正しければそのままでよい。"
             "別の書式なら case を足す。警告が不要なら [settings] rare_shape = 0",
+    "L401": "正規表現の繰り返しを入れ子にしない。(\\d+)+ は \\d+ と同じ意味で、ずっと速い",
     "C121": "同義語表に無い値。[synonyms.*] に追加するか on_unknown を見直す（survey の candidates 参照）",
     "C141": "訂正ファイルの [[hold]]（保留）に当たった値。変換せず元の値のまま通している。"
             "判断がついたら [[hold]] を消し、誤記なら [[correct]] に、正しい値ならルールを足す",
@@ -44,6 +45,9 @@ def issue_dict(i: Issue) -> dict:
 
 
 # ---------------------------------------------------------------- lint（設定だけで分かる注意）
+_NESTED_REPEAT = re.compile(r"\((?:[^()\\]|\\.)*[+*](?:[^()\\]|\\.)*\)\s*(?:[+*]|\{\d+,\}?)")
+
+
 def lint(cfg: Config) -> list[dict]:
     out: list[dict] = []
     for fr in cfg.fields:
@@ -51,6 +55,17 @@ def lint(cfg: Config) -> list[dict]:
             out.append({"code": "L101", "where": fr.src,
                         "message": "出力は単位なしの数値になるため、変換済みCSVをもう一度通すとC102になる。"
                                    "default_unit を指定すると再実行できる"})
+    seen_rx: set[str] = set()
+    for fr in cfg.fields:
+        cands = [(fr, "match / extract")] if fr.extract is not None and fr.label in ("", "match") else []
+        cands += [(alt, "match") for alt in fr.alts.values() if alt.label == "match"]
+        for x, what in cands:
+            pat = x.extract.pattern
+            if pat not in seen_rx and _NESTED_REPEAT.search(pat):
+                seen_rx.add(pat)
+                out.append({"code": "L401", "where": fr.src,
+                            "message": f"{what} の正規表現 {pat!r} に、繰り返しの中の繰り返し（(a+)+ の形）があります。"
+                                       "一致しない値で処理が止まったように遅くなることがあります。内側か外側の繰り返しを外してください"})
     used = {fr.synonyms for fr in cfg.fields if fr.synonyms}
     for name in cfg.synonyms:
         if name not in used:
@@ -216,7 +231,8 @@ def group_issues(issues: list[Issue], examples: int = 3, rows: int = 5) -> list[
     """問題を「列 × コード × 値の形」でまとめる。件数の多い順。行ごとの一覧より桁違いに短い。"""
     by: dict[tuple, dict] = {}
     for i in issues:
-        k = (i.column, i.out if i.code != "C111" else "", i.code, shape_of(i.raw) if i.raw else "")
+        sh = shape_of(i.raw) if i.raw else ""
+        k = (i.column, i.out if i.code != "C111" else "", i.code, sh if len(sh) <= 120 else sh[:120] + "…")
         g = by.setdefault(k, {"column": i.column, "out": k[1], "code": i.code, "severity": i.severity,
                               "shape": k[3], "count": 0, "examples": [], "rows": [],
                               "message": i.message, "hint": HINTS.get(i.code, "")})

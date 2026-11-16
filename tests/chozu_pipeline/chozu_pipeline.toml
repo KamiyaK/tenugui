@@ -1,0 +1,26 @@
+# 連携テスト用の chozu 設定（架空帳票 make_workbook.py 用）
+[ini]
+schema_version = 4
+
+[PIPE]
+section_headers = [
+  ["1.寸法", 1],
+  ["2.試験", 2],
+]
+rules = [
+  [
+    { mark = '発\s*行', at = [0, 2], name = "issue_date", mode = "date" },
+    { mark = "品番", at = [0, 2], name = "part_no" },
+    { mark = "種別", at = [0, 2], name = "kind", required = false },
+  ],
+  [
+    { mark = "幅", at = [0, 2], name = "width", mode = "format" },
+    { mark = "全長", at = [0, 2], name = "length", mode = "format" },
+  ],
+  [
+    { mark = "定格", at = [0, 2], name = "rating" },
+    { mark = "試験時間", at = [0, 2], name = "test_time", required = false },
+    { mark = "備考", at = [1, 0, "F", 0], name = "note", mode = "range", sep = "\n", required = false },
+  ],
+]
+ignore_words = [[], [], []]
