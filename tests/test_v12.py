@@ -1,11 +1,11 @@
 """0.12.0: 表の書き出し（CSV / xlsx）。survey -o と UI の「表示中のタブを書き出す」が使う export_tables。"""
 import csv
 import json
-import subprocess
 import sys
 import zipfile
 import xml.etree.ElementTree as ET
 
+from tenugui.cli import main
 from tenugui.export import export_tables
 from tenugui.ui import Model
 
@@ -53,24 +53,22 @@ def test_xlsx_sheets_and_text_kept(tmp_path):
     assert got["形"] == [["列", "件数", "例"], ["x", "2", "001 / <35mm> & \"a\""]]
 
 
-def test_model_shapes_unchanged_and_survey_output(tmp_path):
+def test_model_shapes_unchanged_and_survey_output(tmp_path, capsys):
     (tmp_path / "in.csv").write_text("sheet,len\na,330±15mm\nb,330mm\nc,340mm\n", encoding="utf-8-sig")
     rows = Model().shapes(str(tmp_path / "in.csv"), "")
     assert rows == [("len", 2, 2, "#mm", "330mm / 340mm"), ("", "", 1, "#±#mm", "330±15mm")]
     out = tmp_path / "o" / "s.xlsx"
-    r = subprocess.run([sys.executable, "-m", "tenugui", "survey", str(tmp_path / "in.csv"), "-o", str(out),
-                        "--format", "json"], capture_output=True, text=True, encoding="utf-8")
-    assert r.returncode == 0, r.stderr
-    assert json.loads(r.stdout)["files"] == [str(out)]
+    capsys.readouterr()
+    assert main(["survey", str(tmp_path / "in.csv"), "-o", str(out), "--format", "json"]) == 0
+    assert json.loads(capsys.readouterr().out)["files"] == [str(out)]
     assert read_xlsx(out)["形"] == [["列", "形の種類", "件数", "形", "例"], ["len", "2", "2", "#mm", "330mm / 340mm"],
                                     ["", "", "1", "#±#mm", "330±15mm"]]
 
 
 def test_survey_output_with_column_is_usage_error(tmp_path):
     (tmp_path / "in.csv").write_text("sheet,len\na,1mm\n", encoding="utf-8-sig")
-    r = subprocess.run([sys.executable, "-m", "tenugui", "survey", str(tmp_path / "in.csv"), "-k", "len",
-                        "-o", str(tmp_path / "x.csv")], capture_output=True, text=True, encoding="utf-8")
-    assert r.returncode == 2
+    assert main(["survey", str(tmp_path / "in.csv"), "-k", "len", "-o", str(tmp_path / "x.csv")]) == 2
+    assert not (tmp_path / "x.csv").exists()
 
 
 def test_ui_export_current_tab_with_fake_tkinter(tmp_path, monkeypatch):
