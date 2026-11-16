@@ -8,9 +8,10 @@ import traceback
 from pathlib import Path
 
 from . import __version__
-from .analysis import (convert_to_files, draft_toml, header_drift, lint, run_tests, suggest, survey_overview,
-                       try_row, verify_files)
+from .analysis import (SHAPE_HEADER, convert_to_files, draft_toml, header_drift, lint, run_tests, shape_table,
+                       suggest, try_row, verify_files)
 from .cli import default_out_dir, resolve_output
+from .export import export_tables
 from .core import ConfigError, check_header, config_from_dict, load_config, read_csv, uniquify
 
 PREVIEW_ROWS = 200
@@ -122,14 +123,7 @@ class Model:
             self.load(csv_path, toml_path)
         except ConfigError:
             self.load(csv_path, "")           # 設定が未完成でも、形の集計は見られるようにする
-        rows = []
-        for o in survey_overview(self.cfg, self.header, self.rows, top=50):
-            if not all_columns and not (o["shape_count"] > 1 and any("#" in x["shape"] for x in o["shapes"])):
-                continue
-            for k, sh in enumerate(o["shapes"]):
-                rows.append((o["column"] if k == 0 else "", o["shape_count"] if k == 0 else "", sh["count"],
-                             sh["shape"], " / ".join(sh["examples"])))
-        return rows
+        return shape_table(self.cfg, self.header, self.rows, all_columns)
 
     def group_detail(self, n: int) -> list[str]:
         """問題の内訳 n 番目（0始まり）の説明と修正案。"""
@@ -537,7 +531,41 @@ def main() -> int:
         import webbrowser
         webbrowser.open(Path(m.html_path).resolve().as_uri())
 
+    # 表示中のタブの表を書き出す（画面に出ている内容そのまま。「問題」は絞り込み後、「出力プレビュー」は先頭 PREVIEW_ROWS 行）
+    def tab_tables() -> tuple[str, list]:
+        cur = nb.nametowidget(nb.select())
+        name = nb.tab(cur, "text")
+        trees = {tab_shape: [("形", t_shape)], tab_iss: [("問題", t_iss)], tab_grp: [("内訳と修正案", t_grp)],
+                 f_chg: [("変更", t_chg)], f_prev: [("出力プレビュー", prev_holder["tree"])],
+                 tab_ver: [("前後チェック_列", t_cols), ("前後チェック_違反", t_vio)]}.get(cur, [])
+        return name, [(n, list(t.cget("columns")), [list(t.item(i, "values")) for i in t.get_children()])
+                      for n, t in trees if t is not None]
+
+    def do_export():
+        name, tables = tab_tables()
+        if not tables:
+            messagebox.showinfo("Tenugui", f"「{name}」タブは表ではないので書き出せません（表のあるタブを開いてください）")
+            return
+        if not any(rows for _, _, rows in tables):
+            messagebox.showinfo("Tenugui", f"「{name}」タブにまだ何も表示されていません")
+            return
+        dd = default_out_dir(v_in.get()) if v_in.get() else Path.cwd()
+        dd.mkdir(parents=True, exist_ok=True)
+        stem = Path(v_in.get()).stem + "_" if v_in.get() else ""
+        p = filedialog.asksaveasfilename(defaultextension=".xlsx", initialdir=str(dd),
+                                         initialfile=f"{stem}{name}.xlsx",
+                                         filetypes=[("Excel", "*.xlsx"), ("CSV", "*.csv")])
+        if not p:
+            return
+        try:
+            files = export_tables(p, tables)
+        except PermissionError:
+            messagebox.showerror("Tenugui", f"書き込めません（Excel で開いたままになっていませんか）: {p}")
+            return
+        messagebox.showinfo("Tenugui", "書き出しました:\n" + "\n".join(map(str, files)))
+
     ttk.Button(bar, text="出力フォルダを開く", command=open_out_dir).pack(side="right", padx=2)
+    ttk.Button(bar, text="表示中のタブを書き出す", command=do_export).pack(side="right", padx=2)
     ttk.Button(bar, text="レポートを開く", command=open_report).pack(side="right", padx=2)
 
     say(["1. 入力CSV（chozuの出力）を選ぶ",

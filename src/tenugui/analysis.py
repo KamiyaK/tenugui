@@ -766,3 +766,22 @@ def convert_to_files(cfg: Config, config_path: str, input_path: str, header: lis
             "files": files, "errors": e, "warnings": len(issues) - e, "duplicates": dups,
             "header_sha": header_sha(uh), "groups": groups, "coverage": cover, "provenance": pv,
             "unused": unused_entries(cfg.corrections, prov, uh)}
+
+
+SHAPE_HEADER = ["列", "形の種類", "件数", "形", "例"]
+
+
+def shape_table(cfg: Config, header: list[str], rows: list[list[str]], all_columns: bool = False,
+                top: int = 50) -> list[tuple]:
+    """UI「形」タブの表。行 = (列, 形の種類数, 件数, 形, 例)。列名・種類数は各列の先頭行だけに入る。
+
+    all_columns=False は「数値を含み、形が2種類以上ある列」だけ（survey の既定と同じ絞り込み）。
+    """
+    out = []
+    for o in survey_overview(cfg, header, rows, top=top):
+        if not all_columns and not (o["shape_count"] > 1 and any("#" in x["shape"] for x in o["shapes"])):
+            continue
+        for k, sh in enumerate(o["shapes"]):
+            out.append((o["column"] if k == 0 else "", o["shape_count"] if k == 0 else "", sh["count"],
+                        sh["shape"], " / ".join(sh["examples"])))
+    return out

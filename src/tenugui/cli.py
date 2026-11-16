@@ -13,13 +13,14 @@ import re
 import sys
 from pathlib import Path
 
-from .analysis import (case_coverage, compare_outputs, convert_to_files, diff_changes, draft_toml,
-                       group_issues, header_drift, header_sha, idempotency_report, impact, issue_dict, lint,
+from .analysis import (SHAPE_HEADER, case_coverage, compare_outputs, convert_to_files, diff_changes, draft_toml,
+                       group_issues, header_drift, header_sha, idempotency_report, impact, issue_dict, lint, shape_table,
                        lock_path, run_tests, suggest, survey_full, survey_overview, as_test_block, try_row,
                        verify_before_after, verify_files, write_lock, write_log)
 from .core import (ConfigError, check_header, config_from_dict, convert_rows, did_you_mean, load_config,
                    read_csv, uniquify, write_csv, write_report)
 from .corrections import KIND_LABEL, Provenance
+from .export import export_tables
 
 SCHEMA = "tenugui.{}/1"
 
@@ -286,6 +287,16 @@ def cmd_verify(args) -> int:
 def cmd_survey(args) -> int:
     cfg = _cfg(args)
     header, rows = read_csv(args.input, cfg.encoding_in)
+    if args.output:
+        if args.column:
+            print("survey -o は概況（-k なし）だけで使えます", file=sys.stderr)
+            return 2
+        files = export_tables(args.output, [("形", SHAPE_HEADER, shape_table(cfg, header, rows, args.all))])
+        if args.format == "json":
+            _json({"schema": SCHEMA.format("export"), "files": [str(f) for f in files]})
+        else:
+            print("形の集計を書き出しました → " + ", ".join(map(str, files)))
+        return 0
     if not args.column:
         ov = survey_overview(cfg, header, rows)
         if not args.all:
@@ -585,6 +596,8 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--all", action="store_true", help="概況で、形が1種類の列も出す")
     s.add_argument("--top", type=int, default=30)
     s.add_argument("--format", choices=["text", "json"], default="text")
+    s.add_argument("-o", "--output", metavar="FILE",
+                   help="概況（UIの「形」タブと同じ表）を書き出す。.xlsx なら Excel、それ以外は CSV（utf-8-sig）")
     _cor(s)
     s.set_defaults(fn=cmd_survey)
 
