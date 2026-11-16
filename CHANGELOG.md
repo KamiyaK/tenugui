@@ -3,6 +3,18 @@
 書き方は [Keep a Changelog](https://keepachangelog.com/ja/1.1.0/) に、版番号は [セマンティック バージョニング](https://semver.org/lang/ja/) に沿う。
 1.0.0 までは、設定ファイル（`schema_version = 1`）の既存の書き方の意味は変えない方針。
 
+## [0.12.0] - 2026-11-16
+
+表の書き出し。既存の設定・出力・終了コードは変わらない。
+
+### 追加
+- `tenugui survey IN -o FILE`: 形の集計（UIの「形」タブと同じ表）を書き出す。`.xlsx` なら Excel、それ以外は CSV（utf-8-sig）
+- UI「表示中のタブを書き出す」ボタン: 形・問題・内訳と修正案・変更・出力プレビュー・前後チェックの表を、画面に出ている内容そのままで Excel / CSV に保存（既定の保存先は tenugui_out/）。前後チェックは xlsx なら「列」「違反」の2シート、CSV なら2ファイル
+- `tenugui.export.export_tables`: 標準ライブラリだけで xlsx を書く（値は文字列のまま。`001` や `35mm` を Excel が数値・日付に変えない）
+
+### 変更
+- 形の集計の表を `analysis.shape_table` にまとめ、UI と `survey -o` で共有（内容は変わらない）
+
 ## [0.11.0] - 2026-11-15
 
 元データの問題を「黙って直さない」ための版。訂正ファイルを置かなければ、今までの設定・出力（CSV・終了コード）は変わらない。
@@ -119,6 +131,8 @@
 ### 追加
 - TOML ルールによる chozu 出力CSVの変換: 表記ゆれの統一、単位の換算・除去・付加、派生計算
 
+[0.12.0]: https://github.com/KamiyaK/tenugui/compare/v0.11.0...v0.12.0
+[0.11.0]: https://github.com/KamiyaK/tenugui/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/KamiyaK/tenugui/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/KamiyaK/tenugui/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/KamiyaK/tenugui/compare/v0.7.0...v0.8.0

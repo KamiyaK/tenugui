@@ -138,7 +138,12 @@ parts = { nom = "wire{n}_len_nom", tol = "wire{n}_len_tol" }      # 部品名 = 
 ```
 tenugui survey in.csv              # 数値を含み、形が2種類以上ある列の概況
 tenugui survey in.csv -k 列名       # 1列を詳しく（形・値・単位・表記ゆれ候補）
+tenugui survey in.csv -o 形.xlsx    # 概況（UIの「形」タブと同じ表）を Excel に。.csv なら CSV（utf-8-sig）
 ```
+
+UI では、表のあるタブ（形・問題・内訳と修正案・変更・出力プレビュー・前後チェック）を開いて
+「表示中のタブを書き出す」を押すと、画面に出ている内容そのままを Excel / CSV に保存できる
+（「問題」は絞り込み後、「出力プレビュー」は先頭200行。前後チェックは xlsx なら2シート、CSV なら2ファイル）。
 
 **pattern（簡易記法）** — 形をそのままルールに書ける。正規表現は不要。
 

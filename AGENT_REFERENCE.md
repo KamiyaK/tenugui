@@ -1,6 +1,6 @@
 # Tenugui AGENT_REFERENCE（agent向け・機械向けの仕様）
 
-動機や比喩は書かない。人向けは README.md。バージョン 0.11.0 / schema_version = 1。
+動機や比喩は書かない。人向けは README.md。バージョン 0.12.0 / schema_version = 1。
 
 ## 0. 不変条件
 - I1 決定的: 同じ入力・同じ設定なら同じ出力。乱数・時刻・ネットワークを使わない
@@ -158,6 +158,7 @@ JSON: `convert` の `verification:{ok,summary,violations[]}`、`verify` は `{sc
 - `tenugui verify IN OUT_CSV -c R [--format json] [--fail-on ...(既定error)]`
 - `tenugui draft IN [-c R] [-o draft.toml(既定 tenugui_out/draft.toml)] [--stdout]` → 実態から作る下書き。exact な表記ゆれと、単位付き数値列(80%以上が読める)だけを出し、疑い(similar)は `#` コメントにする。**下書きは必ず `check` と `try` で検証してから使う**
 - `tenugui survey IN [--all] --format json`（`-k` なし）→ 全列の概況 `{schema:"tenugui.survey_overview/1", rows, columns:[{column, filled, ng, distinct, shape_count, shapes[{shape,count,distinct,examples[]}]}]}`。既定は数値を含み形が2種類以上の列だけ。`-k 列` の結果にも `shapes[]` が入る
+- `tenugui survey IN [--all] [-c R] -o FILE` → 概況を表（列, 形の種類, 件数, 形, 例。列名・種類数は各列の先頭行だけ）で書き出す。拡張子 `.xlsx` なら Excel、それ以外は CSV（utf-8-sig）。`--format json` で `{schema:"tenugui.export/1", files[]}`。`-k` と併用は終了コード 2。agent が形を読むなら `--format json`（`-o` なし）のほうが扱いやすい
 - convert の JSON に追加: `issue_groups[{column,out,code,severity,shape,count,examples[],rows[],message,hint}]`（件数順）, `case_coverage[{column,cases[{case,label,count}],unmatched,empty,ng}]`。**大きなCSVでは `--max-issues 0` を付け、`issue_groups` だけ読む**
 - `tenugui suggest IN -c R [--max-groups N] --format json` → `{schema:"tenugui.suggest/1", rows, groups:[{...issue_groupsと同じ..., suggestion:{kind, toml, note, confidence}}], groups_truncated}`。kind: `add_case`（既存の case 形式に足す）/ `to_case`（単一の書式を case 形式に直して足す）/ `to_pattern`（plain な field を分割に変える）/ `use_to` / `add_strip_unit` / `add_default_unit` / `add_synonym` / `none`。confidence: medium / low / none。**部品と出力列の対応は左からの順の推測**（`#~#mm` の2つ目は許容差ではなく上限、など）なので必ず意味を確認する。ファイルは書かない
 - `tenugui test -c R --format json` → `{schema:"tenugui.test/1", total, failed, ok, failures:[{name, in, diffs:[{column, expected, actual}]}]}`。終了コード 0/1。check の JSON にも `tests` が入る
