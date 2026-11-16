@@ -25,9 +25,20 @@ _NUM_UNIT = re.compile(
 )
 
 
+# 目に見えない文字（ゼロ幅スペース・BOM・語の結合子など）。Excel からの貼り付けで紛れ込み、見た目は同じなのに一致しない原因になる
+_INVISIBLE = dict.fromkeys(map(ord, "\u200b\u200c\u200d\u2060\ufeff\u00ad"))
+_WS_RUN = re.compile(r"\s+")
+MAX_UNIT_LEN = 40          # これより長い「単位」は単位ではない（注記など）
+
+
 def normalize_text(s: str) -> str:
-    """NFKC（全角→半角、㎜→mm、℃→°C 等）＋前後空白除去。表記ゆれの第一段。"""
-    return unicodedata.normalize("NFKC", s).strip()
+    """NFKC（全角→半角、㎜→mm、℃→°C 等）＋見えない文字の除去＋前後空白除去。表記ゆれの第一段。"""
+    return unicodedata.normalize("NFKC", s).translate(_INVISIBLE).strip()
+
+
+def squash_ws(s: str) -> str:
+    """空白の連続（改行・タブを含む）を1つの空白にする。数値や書式の照合の前にかける。"""
+    return _WS_RUN.sub(" ", s)
 
 
 def fold_key(s: str) -> str:
@@ -40,7 +51,10 @@ def format_decimal(d: Decimal, decimals: int | None = None, trim: bool = True) -
     if decimals is not None:
         q = Decimal(1).scaleb(-decimals)
         from decimal import ROUND_HALF_UP
-        d = d.quantize(q, rounding=ROUND_HALF_UP)
+        try:
+            d = d.quantize(q, rounding=ROUND_HALF_UP)
+        except InvalidOperation:        # 桁が多すぎて丸められない。丸めずに出す
+            pass
     s = format(d, "f")
     if trim and "." in s:
         s = s.rstrip("0").rstrip(".")
@@ -200,33 +214,55 @@ class UnitTable:
         return base_val / b.scale
 
 
+MAX_DIGITS = 28        # Decimal の計算精度。これを超える桁は、換算のときに黙って丸められてしまう
+MAX_EXPONENT = 40      # 10 の ±40 乗を超える値は、設計値としてあり得ない（1E1250 のような読み違いを通さない）
+
+
+def _check_size(num: Decimal, text: str) -> Decimal:
+    if not num.is_finite():
+        raise UnitError(f"数値として読めません: {_short(text)}")
+    if num and abs(num.adjusted()) > MAX_EXPONENT:
+        raise UnitError(f"数値が大きすぎるか小さすぎます（10 の ±{MAX_EXPONENT} 乗まで）: {_short(text)}")
+    if len(num.as_tuple().digits) > MAX_DIGITS:
+        raise UnitError(f"桁数が多すぎます（有効数字 {MAX_DIGITS} 桁まで）: {_short(text)}")
+    return num
+
+
+def _short(text: str, n: int = 60) -> str:
+    """エラーメッセージ用に値を短くする。"""
+    r = repr(text)
+    return r if len(r) <= n else r[:n] + f"…（{len(text)}文字）"
+
+
 def parse_quantity(text: str, table: UnitTable) -> tuple[Decimal, str | None]:
     """'35mm' / '１．５ cm' / '1,200V' -> (Decimal, canonical unit | None)。
 
     数値で始まらない・数値が複数ある（φ10±0.2 など）ものは UnitError。
     そういう複合表記は呼び出し側で regex 分割してから渡すこと。
     """
-    t = normalize_text(text).translate(_MINUS)
+    t = squash_ws(normalize_text(text).translate(_MINUS))
     t = re.sub(r"(?<=\d),(?=\d{3}(?!\d))", "", t)  # 桁区切り
     m = _NUM_UNIT.match(t)
     if not m:
-        raise UnitError(f"数値+単位として読めません: {text!r}")
+        raise UnitError(f"数値+単位として読めません: {_short(text)}")
+    if m.group("unit") and len(m.group("unit")) > MAX_UNIT_LEN:
+        raise UnitError(f"数値の後ろが長すぎて単位として読めません: {_short(text)}")
     try:
         num = Decimal(m.group("num"))
     except InvalidOperation as e:
         raise UnitError(f"数値として読めません: {text!r}") from e
     unit = m.group("unit")
-    return num, (table.canon_unit(unit) if unit else None)
+    return _check_size(num, text), (table.canon_unit(unit) if unit else None)
 
 
 def parse_number(text: str) -> Decimal:
     """先頭の数値だけを取り出す。後ろに何があっても（単位・注記）捨てる。換算はしない。"""
-    t = normalize_text(text).translate(_MINUS)
+    t = squash_ws(normalize_text(text).translate(_MINUS))
     t = re.sub(r"(?<=\d),(?=\d{3}(?!\d))", "", t)
     m = re.match(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?", t)
     if not m:
         raise UnitError(f"先頭が数値ではありません: {text!r}")
     try:
-        return Decimal(m.group(0))
+        return _check_size(Decimal(m.group(0)), text)
     except InvalidOperation as e:
         raise UnitError(f"数値として読めません: {text!r}") from e

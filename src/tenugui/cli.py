@@ -140,6 +140,12 @@ def resolve_output(input_path: str, output: str | None, out_dir: str | None, sta
         out = d / f"{Path(input_path).stem}_tenugui.csv"
     if stamp:
         out = out.with_name(f"{out.stem}_{datetime.datetime.now():%Y%m%d_%H%M%S}{out.suffix}")
+    try:
+        same = out.resolve() == Path(input_path).resolve()
+    except OSError:
+        same = False
+    if same:
+        raise ConfigError([f"出力先が入力ファイルと同じです: {out}。入力を上書きしないよう、別の名前か --out-dir を指定してください"])
     out.parent.mkdir(parents=True, exist_ok=True)
     return out
 
@@ -311,6 +317,11 @@ def cmd_survey(args) -> int:
             for sh in o["shapes"]:
                 print(f"  {sh['count']:6d}  {sh['shape']}    例 {sh['examples'][0]!r}")
         return 0
+    uh, _ = uniquify(header)
+    bad = [c for c in args.column if c not in uh]
+    if bad:
+        from .core import did_you_mean
+        raise ConfigError([f"入力に列 {c!r} がありません{did_you_mean(c, uh)}" for c in bad])
     res = [survey_full(cfg, header, rows, c, args.top) for c in args.column]
     if args.format == "json":
         _json({"schema": SCHEMA.format("survey"), "columns": [
