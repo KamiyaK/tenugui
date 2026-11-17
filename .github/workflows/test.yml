@@ -10,9 +10,17 @@ on:
 permissions:
   contents: read
 
+# 同じプルリクエストに続けて push したときは、古い方の実行を止める（main への push は止めない）
+concurrency:
+  group: test-${{ github.event_name }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   pytest:
     runs-on: ${{ matrix.os }}
+    # 普段は1分かからない。Windows では止まる値の試験（SIGALRM の時間制限）が飛ばされるので、
+    # 万一固まっても6時間走り続けないように上限を置く
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
