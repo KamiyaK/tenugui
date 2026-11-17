@@ -133,6 +133,10 @@ def parse_corrections(raw: dict, is_reserved: Callable[[str], bool] = lambda s: 
             if is_reserved(d["value"]):
                 p.append(f"{w}: 抽出NG印 {d['value']!r} は訂正・保留の対象にできません（NG印はそのまま通します）")
                 continue
+            if kind == "correct" and is_reserved(d["to"]):
+                p.append(f"{w}: 訂正後の値 {d['to']!r} は抽出NG印と同じ形です。訂正で NG 印を作ることはできません"
+                         "（chozu が読めなかった印と区別できなくなります）")
+                continue
             e = Entry(kind, w, d["column"], d["value"], d.get("to", "") if kind == "correct" else "",
                       d["reason"].strip(), tuple(keys), d.get("ref", "").strip())
             slot = cor.index.setdefault(e.column, {}).setdefault(normalize_text(e.value), {})
@@ -164,7 +168,10 @@ def read_corrections(path: str | Path) -> tuple[dict, str, list[str]]:
         return {}, "", [f"訂正ファイルが見つかりません: {path}"]
     try:
         raw = tomllib.loads(data.decode("utf-8-sig"))
-    except (tomllib.TOMLDecodeError, UnicodeDecodeError) as e:
+    except UnicodeDecodeError:
+        return {}, "", [f"訂正ファイルを UTF-8 として読めません: {path}（UTF-8 で保存し直してください。"
+                        "Shift_JIS や UTF-16 では読めません）"]
+    except tomllib.TOMLDecodeError as e:
         return {}, "", [f"訂正ファイルのTOML構文エラー: {e}（{path}）"]
     return raw, hashlib.sha256(data).hexdigest()[:12], []
 

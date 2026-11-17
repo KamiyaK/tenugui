@@ -1,6 +1,6 @@
 # Tenugui AGENT_REFERENCE（agent向け・機械向けの仕様）
 
-動機や比喩は書かない。人向けは README.md。バージョン 0.12.0 / schema_version = 1。
+動機や比喩は書かない。人向けは README.md。バージョン 0.13.1 / schema_version = 1。
 
 ## 0. 不変条件
 - I1 決定的: 同じ入力・同じ設定なら同じ出力。乱数・時刻・ネットワークを使わない
@@ -16,6 +16,9 @@
 （訂正ファイルがあれば最初に: `[[correct]]` に当たる値は置き換えてから下へ / `[[hold]]` に当たる値は下を一切かけない）
 `reserved?` → 空? → NFKC正規化+strip → `sub` → `synonyms` → `match/extract` → `to`(数値+単位パース→換算) → `decimals/trim/unit_out`
 - NFKC: 全角→半角、`㎜`→`mm`、`℃`→`°C`、`～`→`~`、`²`→`2`、`µ`→`μ`。**正規表現はNFKC後の文字に対して書く**（`～` ではなく `[~～]`、`mm²` ではなく `mm2`）
+- 数値に溶け込ませない文字: 丸数字 `①` は `(1)`、数字の直後の上付き・下付き数字 `5²` は `5^2` にしてから読む。`5①` `5²` は 51・52 ではなく、読めない値として報告する（C101 / C103 / C104 / C111）。単位の後ろ（`mm²`）は今までどおり `mm2`
+- 桁区切り: `1,200` `12,345,678` `1,234.5` だけを数値として読む（先頭 1〜3 桁で 0 始まりでない、あとは 3 桁ずつ）。`0,500` `12345,678` `3,4` は C101
+- マイナス: `−`(U+2212) `‐` `–` `－` は `-`。長音 `ー` は値の先頭で数字の直前にあるときだけ `-`（単位の別名 `メートル` `オーム` の中はそのまま）
 - 数値より前に文字があるもの(`約85mm`, `φ10`)は C101。`sub` で落とすか `match` で数値部分だけ取り出す
 - 数値のあとの残り全部を単位として読む。`4(二重)` は C103。`match` で分ける
 
@@ -31,7 +34,8 @@
 `[[field]]`（preset分解）`src` `preset`(tolerance|range) `parts`={ 部品名 = { out, to, default_unit, ...通常キー } } `drop_src`
 - tolerance: 部品 `nom` `tol` `hi` `lo`。形: `100±5V` `100V±5V` `100V±5` `100+5/-3V` `φ13±0.2` `100V`（許容差なし→tol は空）。先頭の `φΦØ` は無視
 - range: 部品 `lo` `hi`。形: `11.5~13.5A` `5A~10A` `500mA~1.2A`（`～`はNFKCで`~`になる。`-`区切りは負数と区別できないため非対応）
-- `to` を付けた部品は、同じ値の中の単位を共有する（nom は先頭側の単位、tol/hi/lo と range の hi は末尾側の単位を優先）。`to` なしの部品は数値テキストのみ（単位は捨てる）
+- `to` を付けた部品は、同じ値の中の単位を共有する（nom は先頭側の単位、tol/hi/lo と range の hi は末尾側の単位を優先）。`to` なしの部品は数値テキストのみ（単位は捨てる）。ただし **`to` なしの部品で、値の中の2か所の単位が違うとき（`100V±5%`、`100kV±5V`、`500mA~1.2A`）は C103**（数値だけを取ると意味が変わるため。`to` を付けるか `[[field.case]]` で分ける）
+- preset の数値は桁区切りを読む（`1,200±50W` → 1200 / 50）。単位に `, ; 、` は含めない。数字のあとに文字が続く並び（`100V-5V`、`100mm,200mm`）は別の値なので不一致（C111）。`mm2` `min-1` のように数字で終わるものは単位
 - tolerance_range: 部品 `nom` `tol` `hi` `lo` `rlo` `rhi`。tolerance に括弧内の範囲を足した形。`1250W±100W(11.5~13.5A)` `1250W(11.5~13.5A)` `1250W±100W`。nom/tol の単位は tolerance と同じ規則、rlo は範囲の前側の単位→後ろ側、rhi は後ろ側→前側を優先
 - 括弧つき・複数の単位・独自形式は `match`+`parts`
 
@@ -65,6 +69,7 @@
 
 ## 2b. 書式の指定（0.7.0）: `pattern` と `[[field.case]]`
 - `pattern = "#±#mm"`（+ `parts`）: 簡易記法。`#`=数値（部品名 n1, n2, …）、`{name}`=名前付き数値、`[...]`=省略可。数値直後の文字はその数値の単位で、**書いた単位にだけ一致**。単位のない数値は同じ括弧区間の隣の単位を借りる。空白・全角・`～` は吸収。`# [ ] { }` を文字として含む値には使えない（`match` を使う）
+- 符号: `#` は符号つきの数値に一致する。pattern の先頭・`~` の後・`(` の後に書いた `-` は数値の符号（`-#mm` は `-5mm` から -5 を取る）。それ以外の `+` `-`（`#+#-#W`）は区切りで、後ろの数値は符号なしの大きさ
 - 部品は preset と同じ扱い: `to` か `number_only` があれば単位付きで解釈、どちらも無ければ数値の文字列だけ
 - `[[field.case]]`: 1つの `[[field]]`（キーは `src`, `drop_src`, `case` のみ）の下に並べる。各 case は `pattern` | `preset` | `match` のどれか1つ + `parts`。上から順に試し最初の一致を使う。同じ `out` を複数 case で使える。一致した case に無い out は空。全て不一致は C111（1行1件、メッセージに形）。case の parts では `sub` 不可
 - 形 = NFKC後に数値を `#` にした文字列（`330±15mm` → `#±#mm`、桁区切りは残る: `1,200V` → `#,#V`）。**survey / issue_groups / suggest が返す `shape` は、そのまま `pattern` に書ける**
@@ -109,6 +114,8 @@
 
 ## 3b. 出力ファイル（convert）
 既定の出力先 = 入力CSVのあるフォルダの `tenugui_out/`（無ければ作成）。`--out-dir` で変更、`-o` で出力CSV名、`--timestamp` で `_YYYYmmdd_HHMMSS` 付き。
+出力先の保護（終了コード 2、何も書かない）: 出力CSVと同名で書くレポート類が、入力CSV・ルールTOML・訂正ファイル・lock のどれかに重なる / `-o` の拡張子が `.html` `.json` `.log`。`draft -o` と `survey -o` も、入力・設定に重なる名前は使えない。
+書き出しは全部そろってから行う: 途中で失敗したとき（`encoding_out` で書けない文字など）は、何も書かず、前回の出力もそのまま残る。
 出力は3つ: `<名>_tenugui.csv`（変換結果）/ `<名>_tenugui.html`（人が見るレポート。1ページ・単体で開ける。問題セルに色）/ `<名>_tenugui.json`（機械が読むレポート `tenugui.report/1`: version, time, command, input, config, config_sha, header_sha, rows, counts, files, issue_groups[], case_coverage[], issues[]（全件・raw つき）, changes[{row,key,column,before,after}], verification, not_idempotent[], lint[], header_drift）。**後から結果を調べるときは JSON を読む**。訂正ファイルを使っているときだけ `<名>_tenugui_fix.csv`（元データの修正依頼リスト。列: 種類, row, key, column, 元の値, 訂正後, 理由, 根拠。当たりが無ければ見出しだけ）も書く。JSON レポートと convert の JSON には `provenance:{corrections_file, corrections_sha, counts:{normalize, correct, hold}, fix_requests[{kind, where, column, value, to, reason, ref, count, keys[], rows[], keys_truncated}], cells[{kind, row, key, column, before, after, reason, ref, outputs[]}]（訂正・保留のかかったセル全件。`outputs` はその値から作られる出力列。**後段のツールは kind = hold の行の column と outputs を未検査として扱う**）, unused[{code, kind, where, column, value, to, key[], reason, column_missing, message}], glossary[{set, canonical, total, unified, variants[{value, count, canonical}], columns[]}]}` が入る（訂正ファイルが無くても `counts.normalize` と `glossary` は入る）。`changes[]` の各要素に `kind`（`normalize` | `correct`）。HTML は 表記統一=緑 / 訂正=青 / 保留=紫 で色分けし、修正依頼リストと用語対応表（この入力で使われた表記と件数）の節が付く。`--detail-files` で従来の `_conv.csv`（問題一覧）`_diff.csv`（変更セル。`--no-diff` で省略）`.log` も書く
 
 ## 3b2. 元の列の削除 `drop_src`
@@ -127,7 +134,7 @@ JSON: `convert` の `verification:{ok,summary,violations[]}`、`verify` は `{sc
 | C002 | E | 出力列名が入力列と衝突 | out を変える |
 | C101 | E | 数値+単位として読めない | match/parts, extract, sub で数値部分だけ取る |
 | C102 | E | 単位が無く default_unit も無い | default_unit を足す |
-| C103 | E | 未定義の単位 / 次元違い | [units.*]・[unit_alias] に追加、または to を直す |
+| C103 | E | 未定義の単位 / 次元違い / preset の `to` なしの部品で単位が混ざっている（`100V±5%`） | [units.*]・[unit_alias] に追加、または to を直す。混在は部品に to を付けるか case で分ける |
 | C104 | E | number_only で strip_units に無い単位 | strip_units に加える、または to で換算する |
 | C111 | E | match/extract 不一致 | `try` で正規表現を試す（NFKC後の文字で書く） |
 | C121 | W/E | 同義語表に無い | [synonyms.*] に追加（on_unknown=error のとき E） |
@@ -168,7 +175,7 @@ JSON: `convert` の `verification:{ok,summary,violations[]}`、`verify` は `{sc
 - `tenugui compare 旧OUT.csv 新OUT.csv --format json` → 同じ形（issues_* なし）。行は行番号で突き合わせる
 - `tenugui --version`（`-V`）→ `tenugui 0.10.0`
 - `tenugui schema [--format json]` → `{schema:"tenugui.schema/1", version, schema_version, toml:{settings, units, unit_alias, synonyms, field:{forms:{plain,split,case}, value_keys, part_only_keys, order}, derive, test}, presets{名前:{parts[]}}, preset_examples, codes{コード:{severity, meaning, hint}}, notes[]}`。各キーは `{type, desc, default?, required?, requires?, conflicts?}`
-- `tenugui convert フォルダ|IN1 IN2 ... -c R --format json` → `{schema:"tenugui.batch/1", ok, totals:{files, failed, rows, error, warning}, results:[convert と同じ辞書...]}`。フォルダは中の `*.csv`（サブフォルダは見ない）。列が足りないファイルは `results[].input_problems` に入り、残りは続行。終了コードは最も悪いもの。`-o` は使えない
+- `tenugui convert フォルダ|IN1 IN2 ... -c R --format json` → `{schema:"tenugui.batch/1", ok, totals:{files, failed, rows, error, warning}, results:[convert と同じ辞書...]}`。フォルダは中の `*.csv`（サブフォルダは見ない）。列が足りないファイルは `results[].input_problems` に入り、残りは続行。終了コードは最も悪いもの。`-o` は使えない。同じ出力名になる入力（別フォルダの同名 + `--out-dir`）は、2つ目から `<名>_tenugui_2.csv` … に書く（`results[].files` が実際の名前）。フォルダの中にある前回の出力（`<名>_tenugui.csv` と `_fix` `_conv` `_diff`。隣に同名の JSON レポートがあるもの）は入力にせず、`skipped_outputs[]` に入れる。名前で指定したファイルは必ず入力にする
 - `tenugui glossary -c R [IN] [--format text|json|csv]` → 用語対応表（同義語表を「正式名 ← 別名」にしたもの。配布用）。`{schema:"tenugui.glossary/1", rows, terms:[{set, canonical, variants[], columns[], count?, unified?, used?[{value,count}]}]}`。IN を渡すと、実際に使われた件数（count = 全体、unified = 正式名と違う表記の件数）が付く
 - `tenugui lock IN -c R` → R.lock.json に列構成を記録。以後 check/convert が列の増減を C003 で報告
 
@@ -200,6 +207,12 @@ JSON: `convert` の `verification:{ok,summary,violations[]}`、`verify` は `{sc
 - **chozu の `--merge` 出力**は先頭列が `元ファイル`、2列目が `シート名`。tenugui の報告の `key` と訂正ファイルの `key` は先頭列なので、ファイル名になる
 - **値 `NG` / `NG1` / `NG2` は抽出NG印として触らずに通す**（`[settings] reserved`）。帳票に本当に「NG」と書いてある値も同じ扱いになる
 - **数値の上限**: 10 の ±40 乗、有効数字 28 桁、値の長さ 2000 文字。超えるものは C101（読めない値として元のまま残す）。`1E1250` のような読み違いを通さないため
+- **設定ファイルの文字コード**: ルールTOML・訂正ファイルは UTF-8（BOM 付きも可）。Shift_JIS・UTF-16 は設定エラー。`encoding_in` / `encoding_out` に無い文字コード名を書くと設定エラー（check で分かる）
+- **lock が壊れている**（手で編集した、途中で切れた）と check / convert は終了コード 2。`tenugui lock IN -c R` で作り直す
+- **設定エラーになる書き方（0.13.1）**: `sub` の置換後に無いグループ（`'\1'`）/ `reserved` に空文字へ一致する正規表現（`''`、`'.*'`、`'x?'`。全部の値が NG 印扱いになる）/ 派生の `after` に自分の列名 / `[[correct]]` の `to` が抽出NG印の形
+- **`number_only` + `strip_units = ["*"]`** は数値の後ろを何でも捨てる: `10-20` → 10、`1/2` → 1、`100±5` → 100、`12:30` → 12。範囲・分数・時刻が混ざる列には使わない（`["mm"]` のように単位を並べると、それ以外は C104 になる）
+- **preset = "range" は大小を見ない**: `10~5A` は lo=10, hi=5 のまま出る。逆転の検出は後段のチェッカーで行う
+- **同義語の突合は `-` を無視する**: 同義語表に `"5"` があると `-5` も `5` になる。数値の列に synonyms を使わない
 - **pattern**: 数値を隣り合わせて書けない（`##`、`{a}{b}` は設定エラー）。数値の間に空白を書いたら（`# #`）、値にも空白が必要。pattern は 300 文字まで
 - **式**: 関数は `abs(x)` `sqrt(x)` `round(x[, 桁])` `min(a, …)` `max(a, …)`。引数の数が違う・関数名を変数のように書く・2000 文字を超える、は設定エラー。0 除算・負の平方根・桁あふれ（結果が有限でない）は C303
 - **値の型**: `to = "mm"`（文字列）、`decimals = 2`（整数）、`number_only = true`（引用符なし）、`strip_units = ["mm"]`（配列）、`sub = [['正規表現', '置換後']]`。型が違うと、キー名と期待する形を示す設定エラーになる

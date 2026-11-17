@@ -1,10 +1,12 @@
 """設定(TOML)の読み込み・検証と変換エンジン。"""
 from __future__ import annotations
 
+import codecs
 import csv
 import difflib
 import hashlib
 import json
+import os
 import re
 import tomllib
 from collections import Counter
@@ -35,25 +37,38 @@ _TEST_KEYS = {"name", "in", "out", "codes"}
 # ---- 組み込みの分割パターン（NFKC正規化後の文字列に対して使う）
 _NUM = r"[+-]?\d+(?:\.\d+)?"
 _UNS = r"\d+(?:\.\d+)?"
-_U = r"[^\s±+/()~〜\d.\-][^\s±+/()~〜]*"       # 単位: 先頭は数字・記号以外
+# preset 用の数値: 桁区切り（1,200）を数値の一部として読む。pattern は今までどおり（形 #,# を書いた人に気づかせる）
+_PUNS = r"(?:[1-9]\d{0,2}(?:,\d{3})+|\d+)(?:\.\d+)?"
+_PNUM = rf"[+-]?{_PUNS}"
+# 単位: 先頭は数字・記号以外。区切り（, ; 、）は含めない。「数字のあとに文字」が続く並び（V-5V、mm,200mm）は
+# 単位ではなく別の値なので一致させない（mm2、min-1 のように数字で終わるものは単位）
+_U = r"(?![\d.\-])(?:(?!\d+(?:\.\d+)?[^\W\d_])[^\s±+/()~〜,;、])+"
 PRESETS: dict[str, tuple[str, dict[str, list[str]]]] = {
     # 100±5V / 100V±5V / 100±5 / 100+5/-3V / φ13±0.2 / 100V（許容差なし）
     "tolerance": (
-        rf"^[φΦØ]?(?P<nom>{_NUM})\s*(?P<u1>{_U})?\s*"
-        rf"(?:±\s*(?P<tol>{_UNS})|\+\s*(?P<hi>{_UNS})\s*/\s*-\s*(?P<lo>{_UNS}))?\s*(?P<u2>{_U})?$",
+        rf"^[φΦØ]?(?P<nom>{_PNUM})\s*(?P<u1>{_U})?\s*"
+        rf"(?:±\s*(?P<tol>{_PUNS})|\+\s*(?P<hi>{_PUNS})\s*/\s*-\s*(?P<lo>{_PUNS}))?\s*(?P<u2>{_U})?$",
         {"nom": ["u1", "u2"], "tol": ["u2", "u1"], "hi": ["u2", "u1"], "lo": ["u2", "u1"]}),
     # 1250W±100W(11.5～13.5A) / 1250W(11.5～13.5A): 許容差つきの値 + 括弧内の範囲
     "tolerance_range": (
-        rf"^[φΦØ]?(?P<nom>{_NUM})\s*(?P<u1>{_U})?\s*"
-        rf"(?:±\s*(?P<tol>{_UNS})|\+\s*(?P<hi>{_UNS})\s*/\s*-\s*(?P<lo>{_UNS}))?\s*(?P<u2>{_U})?\s*"
-        rf"(?:\(\s*(?P<rlo>{_NUM})\s*(?P<ru1>{_U})?\s*[~〜]\s*(?P<rhi>{_NUM})\s*(?P<ru2>{_U})?\s*\))?$",
+        rf"^[φΦØ]?(?P<nom>{_PNUM})\s*(?P<u1>{_U})?\s*"
+        rf"(?:±\s*(?P<tol>{_PUNS})|\+\s*(?P<hi>{_PUNS})\s*/\s*-\s*(?P<lo>{_PUNS}))?\s*(?P<u2>{_U})?\s*"
+        rf"(?:\(\s*(?P<rlo>{_PNUM})\s*(?P<ru1>{_U})?\s*[~〜]\s*(?P<rhi>{_PNUM})\s*(?P<ru2>{_U})?\s*\))?$",
         {"nom": ["u1", "u2"], "tol": ["u2", "u1"], "hi": ["u2", "u1"], "lo": ["u2", "u1"],
          "rlo": ["ru1", "ru2"], "rhi": ["ru2", "ru1"]}),
     # 11.5～13.5A / 5A～10A
     "range": (
-        rf"^(?P<lo>{_NUM})\s*(?P<u1>{_U})?\s*[~〜]\s*(?P<hi>{_NUM})\s*(?P<u2>{_U})?$",
+        rf"^(?P<lo>{_PNUM})\s*(?P<u1>{_U})?\s*[~〜]\s*(?P<hi>{_PNUM})\s*(?P<u2>{_U})?$",
         {"lo": ["u1", "u2"], "hi": ["u2", "u1"]}),
 }
+
+
+_SIGNS = str.maketrans({"−": "-", "‐": "-", "–": "-", "∼": "~"})
+
+
+def match_text(text: str) -> str:
+    """preset / pattern の照合にかける前の整形: 空白の連続を1つに、マイナスと波線の異体字を - と ~ に。"""
+    return squash_ws(text).translate(_SIGNS)
 
 
 def _clip(text: str, n: int = 80) -> str:
@@ -81,12 +96,17 @@ def compile_pattern(pattern: str) -> tuple[str, dict[str, list[str]]]:
     """
     if len(pattern) > 300:
         raise ValueError(f"pattern が長すぎます（{len(pattern)}文字。上限 300）")
-    t = re.sub(r"\s+", " ", normalize_text(pattern))
+    t = re.sub(r"\s+", " ", normalize_text(pattern)).translate(_SIGNS)
     out: list[str] = ["^"]
     order: list[tuple[str, int, bool]] = []      # (名前, 括弧区間, 自前の単位があるか)
     seg, auto, i, prev_sign, depth, last = 0, 0, 0, False, 0, ""
+    neg = False                 # 直前の - を数値の符号として取り込む
     while i < len(t):
         c = t[i]
+        if c == "-" and t[i + 1:i + 2] in ("#", "{") and (i == 0 or t[i - 1] in "~〜("):
+            # 先頭・~ の後・( の後の - は区切りではなく符号（-5mm の形 -#mm を書いたとき、5 ではなく -5 を取る）
+            neg, i = True, i + 1
+            continue
         if c in "#{":
             if c == "{":
                 j = t.find("}", i)
@@ -105,7 +125,8 @@ def compile_pattern(pattern: str) -> tuple[str, dict[str, list[str]]]:
                 raise ValueError("数値が隣り合っています（## や {a}{b}）。どこで区切るか決まらないので、間に文字か空白を書いてください")
             if last == "num_ws":
                 out[-1] = r"\s+"          # 数値 空白 数値: 空白が無いと 12 を 1 と 2 に分けてしまう
-            out.append(f"(?P<{name}>{_UNS if prev_sign else _NUM})")
+            out.append(f"(?P<{name}>-{_UNS})" if neg else f"(?P<{name}>{_UNS if prev_sign else _NUM})")
+            neg = False
             m = _PAT_UNIT.match(t, i)
             if m:
                 out.append(rf"\s*(?P<u_{name}>{re.escape(m.group())})")
@@ -351,9 +372,11 @@ def _mk_field(f: dict, w: str, units: UnitTable, synonyms: dict, p: list[str]) -
     fr.required = bool(f.get("required", False))
     for j, pair in enumerate(f.get("sub", [])):
         try:
-            fr.sub.append((re.compile(pair[0]), pair[1]))
+            rx = re.compile(pair[0])
+            rx.sub(pair[1], "")          # 置換後の書き方（\\1、\\g<名前>）も今のうちに確かめる。変換の途中で落とさない
+            fr.sub.append((rx, pair[1]))
         except (re.error, IndexError, TypeError) as e:
-            p.append(f"{w}: sub[{j}] が不正 ({e})")
+            p.append(f"{w}: sub[{j}] が不正 ({e})。置換後に \\1 や \\g<名前> を書くときは、正規表現側にそのグループが必要です")
     fr.synonyms = f.get("synonyms")
     if fr.synonyms and fr.synonyms not in synonyms:
         p.append(f"{w}: synonyms = {fr.synonyms!r} に対応する [synonyms.*] がありません"
@@ -483,10 +506,14 @@ def load_config(path: str | Path, corrections: str | Path | None = None) -> Conf
     """ルールTOMLを読む。同じ場所に <ルール名>.corrections.toml があれば訂正・保留も読む
     （corrections で別の場所を指定できる）。"""
     try:
-        with open(path, "rb") as f:
-            raw = tomllib.load(f)
+        data = Path(path).read_bytes()
     except FileNotFoundError:
         raise ConfigError([f"設定ファイルが見つかりません: {path}"]) from None
+    try:
+        raw = tomllib.loads(data.decode("utf-8-sig"))       # メモ帳などが付ける BOM は読み飛ばす
+    except UnicodeDecodeError:
+        raise ConfigError([f"設定ファイルを UTF-8 として読めません: {path}（UTF-8 で保存し直してください。"
+                           "Shift_JIS や UTF-16 では読めません）"]) from None
     except tomllib.TOMLDecodeError as e:
         raise ConfigError([f"TOMLの構文エラー: {e}（よくある原因: 正規表現を \"...\" で書いた → '...' で書く / "
                            "{ } の中で改行した → 1行で書くか [field.parts.名前] の形にする / 文字列の \" の閉じ忘れ）"]) from None
@@ -665,9 +692,21 @@ def _config_from_dict(raw: dict, corrections: dict | None = None) -> Config:
     reserved = []
     for pat in st.get("reserved", [r"^NG\d*$"]):
         try:
-            reserved.append(re.compile(pat))
+            rx = re.compile(pat)
         except re.error as e:
             p.append(f"[settings] reserved の正規表現が不正: {pat!r} ({e})")
+            continue
+        if rx.search(""):
+            p.append(f"[settings] reserved の {pat!r} は空の文字列にも一致します。すべての値が抽出NG印として"
+                     "扱われ、何も変換されなくなります（'^NG\\d*$' のように、印の形を書きます）")
+            continue
+        reserved.append(rx)
+    for key in ("encoding_in", "encoding_out"):
+        if isinstance(st.get(key), str):
+            try:
+                codecs.lookup(st[key])
+            except LookupError:
+                p.append(f"[settings] {key} = {st[key]!r} という文字コードはありません（\"utf-8-sig\" や \"cp932\" のように書きます）")
 
     try:
         units = UnitTable(raw.get("units"), raw.get("unit_alias"))
@@ -780,6 +819,8 @@ def _config_from_dict(raw: dict, corrections: dict | None = None) -> Config:
             p.append(f"{w}: unit_out = add には unit（または to）が必要です")
         if dr.to and not dr.unit:
             p.append(f"{w}: to を使うには式の結果の単位 unit が必要です")
+        if dr.after is not None and dr.after == dr.out:
+            p.append(f"{w}: after に自分自身は書けません（列が出力されなくなります）。直前に置きたい列の名前を書きます")
         for key in ("unit", "to"):
             u = getattr(dr, key)
             if u and not units.known(u):
@@ -910,7 +951,7 @@ def select_case(fr: FieldRule, raw: str) -> int | None:
         return None
     if len(text) > MAX_VALUE_CHARS:
         return -1
-    sq = squash_ws(text)
+    sq = match_text(text)
     for k, rx in enumerate(fr.case_rx):
         if rx.search(text if fr.case_labels[k] == "match" else sq):   # 利用者の正規表現にはそのまま渡す
             return k
@@ -981,10 +1022,15 @@ def _apply_field(cfg: Config, fr: FieldRule, raw: str, nums: dict, rowctx: tuple
         issue("C101", "E", f"値が長すぎて数値として読めません（{len(text)}文字。上限 {MAX_VALUE_CHARS}）")
         return fail
     if fr.extract:
-        m = fr.extract.search(squash_ws(text) if fr.label not in ("", "match") else text)
+        m = fr.extract.search(match_text(text) if fr.label not in ("", "match") else text)
         if not m:
             tr("extract", "不一致")
-            issue("C111", "E", f"{'match' if fr.group else 'extract'} に一致しません: {fr.extract.pattern!r}")
+            if fr.label.startswith("preset:"):       # 内部の正規表現ではなく、書式の名前と値の形を見せる
+                issue("C111", "E", f"{fr.label.replace(':', ' = ')} の書式に一致しません（形: {_clip(shape_of(raw))}）")
+            elif fr.label not in ("", "match"):
+                issue("C111", "E", f"pattern {_clip(fr.label)!r} に一致しません（形: {_clip(shape_of(raw))}）")
+            else:
+                issue("C111", "E", f"{'match' if fr.group else 'extract'} に一致しません: {_clip(repr(fr.extract.pattern), 160)}")
             return fail
         g = m.group(fr.group if fr.group is not None else 1)
         if g is None or g.strip() == "":       # 省略可能なグループが無かった
@@ -993,6 +1039,15 @@ def _apply_field(cfg: Config, fr: FieldRule, raw: str, nums: dict, rowctx: tuple
                 issue("C201", "E", "必須項目が空です（match の該当部分がありません）")
             return ""
         text = g.strip()
+        if fr.label.startswith("preset:"):
+            text = text.replace(",", "")           # 桁区切り（1,200）。preset の数値は区切りを含めて一致させている
+            if not (fr.to or fr.number_only):
+                mixed = _mixed_units(cfg, fr, m)
+                if mixed:
+                    nums[fr.out] = (None, None)
+                    issue("C103", "E", f"1つの値の中で単位が混ざっています（{mixed[0]} と {mixed[1]}）。数値だけを取り出すと"
+                                       "意味が変わります。部品に to を付けて換算するか、[[field.case]] で書式を分けてください")
+                    return fail
         if fr.unit_group:
             ugs = [fr.unit_group] if isinstance(fr.unit_group, str) else fr.unit_group
             text += next((m.group(g).strip() for g in ugs if m.group(g)), "")
@@ -1039,6 +1094,13 @@ def _apply_field(cfg: Config, fr: FieldRule, raw: str, nums: dict, rowctx: tuple
         s += fr.unit_label if fr.unit_label is not None else fr.to
     tr("format", s)
     return s
+
+
+def _mixed_units(cfg: Config, fr: FieldRule, m: re.Match) -> tuple[str, str] | None:
+    """preset で、この部品が共有する2か所の単位（100V±5% の V と %）が両方あって違うとき、その組。"""
+    names = PRESETS[fr.label[len("preset:"):]][1].get(fr.group or "", [])
+    us = [cfg.units.canon_unit(m.group(n)) for n in names if m.group(n)]
+    return (us[0], us[1]) if len(us) == 2 and us[0] != us[1] else None
 
 
 def _var_value(cfg: Config, col: str, unit: str | None, vals: dict, nums: dict,

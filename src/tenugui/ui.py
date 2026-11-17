@@ -64,7 +64,8 @@ class Model:
         probs = check_header(self.cfg, uh)
         if probs:
             raise ConfigError(probs)
-        out = resolve_output(csv_path, out_path or None, None, False)   # tenugui_out/ が無ければ作る
+        out = resolve_output(csv_path, out_path or None, None, False,   # tenugui_out/ が無ければ作る
+                             [("設定ファイル", toml_path)] if toml_path else None)
         r = convert_to_files(self.cfg, toml_path, csv_path, self.header, self.rows, out, verify=verify,
                              command="tenugui ui")
         self.out_header, self.out_rows = r["out_header"], r["out_rows"]

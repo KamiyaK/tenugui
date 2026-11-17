@@ -19,7 +19,10 @@ class UnitError(ValueError):
     pass
 
 
-_MINUS = str.maketrans({"−": "-", "‐": "-", "–": "-", "ー": "-", "－": "-"})
+# マイナスとして読む記号。値のどこにあっても - にする（単位の指数 min⁻¹ → min-1 にも使う）
+_MINUS = str.maketrans({"−": "-", "‐": "-", "–": "-", "－": "-"})
+# 長音「ー」は、値の先頭で数値の直前にあるときだけマイナス（ー5）。単位の中（メートル、オーム）はそのまま
+_HEAD_CHOON = re.compile(r"^ー(?=[\d.])")
 _NUM_UNIT = re.compile(
     r"^(?P<num>[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)\s*(?P<unit>[^\d\s].*)?$"
 )
@@ -31,8 +34,29 @@ _WS_RUN = re.compile(r"\s+")
 MAX_UNIT_LEN = 40          # これより長い「単位」は単位ではない（注記など）
 
 
+def _note_digits() -> dict[int, str]:
+    """丸数字など「数字に見えるが数値の一部ではない」文字 → (n)。
+    NFKC はこれらをただの数字にするので、そのままだと 5① が 51、100⒈ が 1001 と読まれてしまう。"""
+    table: dict[int, str] = {}
+    for lo, hi in ((0x2460, 0x2473), (0x24EA, 0x24EA), (0x2488, 0x249B), (0x3251, 0x325F), (0x32B1, 0x32BF)):
+        for cp in range(lo, hi + 1):
+            d = unicodedata.normalize("NFKC", chr(cp)).rstrip(".")
+            if d.isdigit():
+                table[cp] = f"({d})"
+    return table
+
+
+_NOTE_DIGITS = _note_digits()
+# 数字の直後の上付き・下付き数字（5² や 100₁）。注記か累乗で、数値の続きではない。単位の後ろ（mm²）は今までどおり mm2
+_SUPER_AFTER_DIGIT = re.compile(r"(?<=\d)[\u00b2\u00b3\u00b9\u2070\u2074-\u2079\u2080-\u2089]+")
+
+
 def normalize_text(s: str) -> str:
-    """NFKC（全角→半角、㎜→mm、℃→°C 等）＋見えない文字の除去＋前後空白除去。表記ゆれの第一段。"""
+    """NFKC（全角→半角、㎜→mm、℃→°C 等）＋見えない文字の除去＋前後空白除去。表記ゆれの第一段。
+
+    丸数字は (1)、数字の直後の上付き数字は ^2 にしてから NFKC にかける（数値に溶け込ませない）。"""
+    if not s.isascii():
+        s = _SUPER_AFTER_DIGIT.sub(lambda m: "^" + m.group(), s.translate(_NOTE_DIGITS))
     return unicodedata.normalize("NFKC", s).translate(_INVISIBLE).strip()
 
 
@@ -47,6 +71,9 @@ def fold_key(s: str) -> str:
     return re.sub(r"[\s\-_・]", "", t)
 
 
+_NONZERO = re.compile(r"[1-9]")
+
+
 def format_decimal(d: Decimal, decimals: int | None = None, trim: bool = True) -> str:
     if decimals is not None:
         q = Decimal(1).scaleb(-decimals)
@@ -58,7 +85,9 @@ def format_decimal(d: Decimal, decimals: int | None = None, trim: bool = True) -
     s = format(d, "f")
     if trim and "." in s:
         s = s.rstrip("0").rstrip(".")
-    return "0" if s in ("-0", "") else s
+    if s.startswith("-") and not _NONZERO.search(s):      # -0.00 → 0.00（丸めて 0 になった負の数）
+        s = s[1:]
+    return "0" if s == "" else s
 
 
 # 次元 -> {"base": 基準単位, 単位: 基準単位に対する倍率}
@@ -172,6 +201,8 @@ class UnitTable:
                 if not m:
                     raise UnitError(f"単位式を読めません: {unit!r}")
                 name = self.aliases.get(m.group(1), m.group(1))
+                if len(m.group(2) or "") > 3 or abs(int(m.group(2) or 1)) > MAX_UNIT_EXPONENT:
+                    raise UnitError(f"単位の指数が大きすぎます（±{MAX_UNIT_EXPONENT} まで）: {unit!r}")
                 exp = int(m.group(2) or 1) * sign
                 dim = self.unit_dim.get(name)
                 if dim is None:
@@ -180,7 +211,10 @@ class UnitTable:
                 if name in self.affine:
                     aff = name
                 else:
-                    scale *= self.factors[name] ** exp
+                    try:
+                        scale *= self.factors[name] ** exp
+                    except ArithmeticError:
+                        raise UnitError(f"単位式を計算できません: {unit!r}") from None
                 sig[dim] = sig.get(dim, 0) + exp
         sig = {d: e for d, e in sig.items() if e != 0}
         if aff and (atoms != 1 or sig.get(self.unit_dim[aff]) != 1):
@@ -205,15 +239,19 @@ class UnitTable:
             raise UnitError(f"次元が違います: {src}({_sig_text(a.sig)}) → {dst}({_sig_text(b.sig)})")
         if src == dst:
             return value
-        if a.affine:
-            base_val = self.affine[a.affine][0].eval({"x": value})
-        else:
-            base_val = value * a.scale
-        if b.affine:
-            return self.affine[b.affine][1].eval({"x": base_val})
-        return base_val / b.scale
+        try:
+            if a.affine:
+                base_val = self.affine[a.affine][0].eval({"x": value})
+            else:
+                base_val = value * a.scale
+            if b.affine:
+                return self.affine[b.affine][1].eval({"x": base_val})
+            return base_val / b.scale
+        except ArithmeticError:
+            raise UnitError(f"換算の計算ができません（値が大きすぎるか小さすぎます）: {src} → {dst}") from None
 
 
+MAX_UNIT_EXPONENT = 24  # 単位の指数（mm^3 など）の上限。これを超えるものは単位ではなく読み違い
 MAX_DIGITS = 28        # Decimal の計算精度。これを超える桁は、換算のときに黙って丸められてしまう
 MAX_EXPONENT = 40      # 10 の ±40 乗を超える値は、設計値としてあり得ない（1E1250 のような読み違いを通さない）
 
@@ -234,14 +272,31 @@ def _short(text: str, n: int = 60) -> str:
     return r if len(r) <= n else r[:n] + f"…（{len(text)}文字）"
 
 
+_THOUSANDS = re.compile(r"^([+-]?)([1-9]\d{0,2}(?:,\d{3})+)(?![\d,])")
+_COMMA_IN_NUMBER = re.compile(r"^[+-]?\d+,\d")
+
+
+def _number_head(text: str) -> str:
+    """数値を読む前の整形: 正規化・空白の圧縮・マイナス記号の統一・桁区切りの除去。
+
+    桁区切りと認めるのは 1,200 / 12,345,678 のように、先頭が 1〜3 桁（0 で始まらない）で、あとが 3 桁ずつのものだけ。
+    0,500 や 12345,678 や 3,4 は、小数点のつもりか区切りの位置違いか決められないので読まない。"""
+    t = _HEAD_CHOON.sub("-", squash_ws(normalize_text(text).translate(_MINUS)))
+    m = _THOUSANDS.match(t)
+    if m:
+        return m.group(1) + m.group(2).replace(",", "") + t[m.end():]
+    if _COMMA_IN_NUMBER.match(t):
+        raise UnitError(f"カンマの位置が桁区切り（3桁ごと）になっていません。小数点のつもりか区切りか決められません: {_short(text)}")
+    return t
+
+
 def parse_quantity(text: str, table: UnitTable) -> tuple[Decimal, str | None]:
     """'35mm' / '１．５ cm' / '1,200V' -> (Decimal, canonical unit | None)。
 
     数値で始まらない・数値が複数ある（φ10±0.2 など）ものは UnitError。
     そういう複合表記は呼び出し側で regex 分割してから渡すこと。
     """
-    t = squash_ws(normalize_text(text).translate(_MINUS))
-    t = re.sub(r"(?<=\d),(?=\d{3}(?!\d))", "", t)  # 桁区切り
+    t = _number_head(text)
     m = _NUM_UNIT.match(t)
     if not m:
         raise UnitError(f"数値+単位として読めません: {_short(text)}")
@@ -257,11 +312,12 @@ def parse_quantity(text: str, table: UnitTable) -> tuple[Decimal, str | None]:
 
 def parse_number(text: str) -> Decimal:
     """先頭の数値だけを取り出す。後ろに何があっても（単位・注記）捨てる。換算はしない。"""
-    t = squash_ws(normalize_text(text).translate(_MINUS))
-    t = re.sub(r"(?<=\d),(?=\d{3}(?!\d))", "", t)
+    t = _number_head(text)
     m = re.match(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?", t)
     if not m:
         raise UnitError(f"先頭が数値ではありません: {text!r}")
+    if re.match(r"\.\d", t[m.end():]):         # 1.2.3 の 1.2 だけを取らない（数値がどこまでか決められない）
+        raise UnitError(f"小数点が2つあり、数値として読めません: {_short(text)}")
     try:
         return _check_size(Decimal(m.group(0)), text)
     except InvalidOperation as e:
