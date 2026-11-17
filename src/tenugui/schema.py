@@ -174,6 +174,8 @@ def schema() -> dict:
         "codes": {c: {"severity": sev, "meaning": m, "hint": HINTS.get(c, "")} for c, (sev, m) in CODES.items()},
         "notes": ["訂正・保留は corrections を参照。黙って直さない: 訂正には必ず理由を書き、迷う値は保留にする",
                   "正規表現（match / extract / sub / reserved）は全角半角を統一した後の文字に対して書く。TOML では '...' で書く",
+                  "数値として読む桁区切りは 1,200 / 12,345,678 の形だけ。丸数字（5①）や上付き数字（5²）は数値に含めず、読めない値として報告する",
+                  "pattern の先頭・~ の後・( の後の - は符号（-#mm は -5mm から -5 を取る）。#+#-#W の + - は区切り",
                   "{ ... } のインラインテーブルは1行で書く。長くなるなら [field.parts.名前] の形にする",
                   "設定を書いたら tenugui check -c R IN --format json、変えたら tenugui impact で影響を確かめる"],
     }

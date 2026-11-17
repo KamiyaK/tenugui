@@ -4,12 +4,13 @@ from __future__ import annotations
 import difflib
 import hashlib
 import json
+import os
 import re
 from collections import Counter
 from dataclasses import replace
 from pathlib import Path
 
-from .core import (Config, FieldRule, Issue, _apply_field, _is_reserved, check_header, compile_pattern, is_null,
+from .core import (Config, ConfigError, FieldRule, Issue, _apply_field, _is_reserved, check_header, compile_pattern, is_null,
                    convert_rows, select_case, shape_of, survey as _survey, uniquify)
 from .corrections import KIND_LABEL, Provenance, summarize, unused_entries
 from .units import UnitError, UnitTable, fold_key, normalize_text, parse_quantity
@@ -135,12 +136,19 @@ def header_drift(config_path: str | Path, header: list[str]) -> dict | None:
     p = lock_path(config_path)
     if not p.exists():
         return None
-    old = json.loads(p.read_text(encoding="utf-8"))
+    try:
+        old = json.loads(p.read_text(encoding="utf-8-sig"))
+        cols, sha = old["columns"], old.get("sha", "")
+        if not isinstance(cols, list) or not all(isinstance(c, str) for c in cols) or not isinstance(sha, str):
+            raise ValueError("columns")
+    except (ValueError, KeyError, TypeError, AttributeError):
+        raise ConfigError([f"{p}: 列構成の記録（lock）が壊れていて読めません。`tenugui lock 入力CSV -c 設定` で"
+                           "作り直すか、このファイルを消してください"]) from None
     uh, _ = uniquify(header)
-    added = [c for c in uh if c not in old["columns"]]
-    removed = [c for c in old["columns"] if c not in uh]
-    return {"changed": bool(added or removed or uh != old["columns"]), "added": added,
-            "removed": removed, "sha": header_sha(uh), "locked_sha": old["sha"]}
+    added = [c for c in uh if c not in cols]
+    removed = [c for c in cols if c not in uh]
+    return {"changed": bool(added or removed or uh != cols), "added": added,
+            "removed": removed, "sha": header_sha(uh), "locked_sha": sha}
 
 
 # ---------------------------------------------------------------- survey / 同義語候補
@@ -462,7 +470,13 @@ def suggest(cfg: Config, header: list[str], rows: list[list[str]]) -> list[dict]
 
 # ---------------------------------------------------------------- draft（ルールの下書き）
 def _q(s: str) -> str:
-    return json.dumps(s, ensure_ascii=False)
+    """TOML の文字列。JSON の書き方がそのまま使えるが、DEL(0x7f) だけは TOML では生で書けない。"""
+    return json.dumps(s, ensure_ascii=False).replace("\x7f", "\\u007f")
+
+
+def _c(s) -> str:
+    """TOML のコメントに入れる文字列。改行・制御文字があると、コメントが途中で切れて設定として読めなくなる。"""
+    return re.sub(r"[\x00-\x1f\x7f\u0085\u2028\u2029]", " ", str(s))
 
 
 def draft_toml(cfg: Config, header: list[str], rows: list[list[str]]) -> str:
@@ -493,24 +507,24 @@ def draft_toml(cfg: Config, header: list[str], rows: list[list[str]]) -> str:
         if parsed / total >= 0.8 and known:
             to = max(known, key=known.get)
             field_blocks.append(
-                f"[[field]]\nsrc = {_q(col)}\nto = {_q(to)}\ndefault_unit = {_q(to)}   # 単位なしの値は{to}とみなす\n"
-                f"# 検出された単位: {', '.join(f'{u}×{n}' for u, n in units.most_common())}\n")
+                f"[[field]]\nsrc = {_q(col)}\nto = {_q(to)}\ndefault_unit = {_q(to)}   # 単位なしの値は{_c(to)}とみなす\n"
+                f"# 検出された単位: {_c(', '.join(f'{u}×{n}' for u, n in units.most_common()))}\n")
             continue
         allc = synonym_candidates(vals)
         cands = [c for c in allc if c["kind"] == "exact"]   # 下書きに載せるのは機械的に同一視できるものだけ
         for c in allc:
             if c["kind"] != "exact":
-                notes.append(f"# {col}: 表記ゆれの疑い（要確認）{c['canonical']!r} ← {c['variants']}")
+                notes.append(_c(f"# {col}: 表記ゆれの疑い（要確認）{c['canonical']!r} ← {c['variants']}"))
         if cands:
             name = col
             body = "".join(f"{_q(c['canonical'])} = [{', '.join(_q(v) for v in c['variants'])}]"
-                           f"   # {c['kind']}・{c['count']}件\n" for c in cands)
+                           f"   # {_c(c['kind'])}・{c['count']}件\n" for c in cands)
             syn_blocks.append(f"[synonyms.{_q(name)}]\n{body}")
             field_blocks.append(f"[[field]]\nsrc = {_q(col)}\nsynonyms = {_q(name)}\non_unknown = \"warn\"\n")
             continue
         comp = [v for v in vals if any(ch in v for ch in "±×～~") and any(c.isdigit() for c in v)]
         if comp:
-            notes.append(f"# {col}: 複合表記（例 {comp[0]!r}）。match と parts で分解する")
+            notes.append(_c(f"# {col}: 複合表記（例 {comp[0]!r}）。match と parts で分解する"))
     head = ("# tenugui draft — 自動生成の下書き。そのまま使わず、内容を確認して check で検証すること\n"
             "schema_version = 1\n\n")
     return head + "".join(b + "\n" for b in syn_blocks) + "".join(b + "\n" for b in field_blocks) \
@@ -722,6 +736,39 @@ def _write_fix(path: Path, cells: list[dict], enc: str) -> None:
                         c["reason"], c["ref"]])
 
 
+class _Staged:
+    """出力ファイルをいったん仮の名前で書き、全部書けてから本当の名前にする。
+    途中で失敗したとき（書けない文字、ディスクの空き）に、書きかけのファイルや古い結果との混在を残さない。"""
+
+    def __init__(self) -> None:
+        self.pairs: list[tuple[Path, Path]] = []
+
+    def path(self, final: Path) -> Path:
+        tmp = final.with_name(final.name + ".writing")
+        self.pairs.append((tmp, final))
+        return tmp
+
+    def commit(self) -> None:
+        try:
+            for tmp, final in self.pairs:
+                os.replace(tmp, final)
+        finally:
+            self.discard()
+
+    def discard(self) -> None:
+        for tmp, _ in self.pairs:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+
+def output_files(out: Path) -> list[Path]:
+    """出力CSV out と一緒に書く（ことがある）ファイル。上書きしてはいけない相手との照合に使う。"""
+    return [out, out.with_suffix(".html"), out.with_suffix(".json"), out.with_suffix(".log"),
+            *(out.with_name(out.stem + x) for x in ("_fix.csv", "_conv.csv", "_diff.csv"))]
+
+
 def convert_to_files(cfg: Config, config_path: str, input_path: str, header: list[str],
                      rows: list[list[str]], out: Path, *, no_diff: bool = False,
                      verify: bool = False, command: str = "", detail_files: bool = False,
@@ -738,7 +785,30 @@ def convert_to_files(cfg: Config, config_path: str, input_path: str, header: lis
     prov = Provenance()
     out_header, out_rows, issues = convert_rows(cfg, header, rows, prov)
     out.parent.mkdir(parents=True, exist_ok=True)
-    write_csv(out, out_header, out_rows, cfg.encoding_out)
+    st = _Staged()
+    try:
+        res = _write_outputs(st, cfg, config_path, input_path, header, rows, out, out_header, out_rows, issues,
+                             prov, uh, dups, drift, no_diff, verify, command, detail_files, report_unused)
+        st.commit()
+        return res
+    except UnicodeEncodeError as e:
+        st.discard()
+        raise ConfigError([f"[settings] encoding_out = {cfg.encoding_out!r} では書けない文字 "
+                           f"{e.object[e.start:e.end]!r} があります。出力は書いていません。encoding_out を \"utf-8-sig\"（既定）に"
+                           "すると、どの文字も書けます"]) from None
+    except BaseException:
+        st.discard()
+        raise
+
+
+def _write_outputs(st: _Staged, cfg: Config, config_path: str, input_path: str, header: list[str],
+                   rows: list[list[str]], out: Path, out_header: list[str], out_rows: list[list[str]],
+                   issues: list[Issue], prov: Provenance, uh: list[str], dups: list[str], drift: dict | None,
+                   no_diff: bool, verify: bool, command: str, detail_files: bool, report_unused: bool) -> dict:
+    from . import __version__
+    from .core import outputs_from, write_csv, write_report
+    from .report import build_report, render_html, write_json
+    write_csv(st.path(out), out_header, out_rows, cfg.encoding_out)
     htmlp, jsonp = out.with_suffix(".html"), out.with_suffix(".json")
     files = {"output": str(out), "html": str(htmlp), "json": str(jsonp)}
     changes = diff_changes(header, rows, out_header, out_rows)
@@ -746,7 +816,7 @@ def convert_to_files(cfg: Config, config_path: str, input_path: str, header: lis
     cells = pv["cells"]
     fixp = out.with_name(out.stem + "_fix.csv")
     if cfg.corrections is not None:     # 訂正ファイルを使っているときだけ書く（当たりが無ければ見出しだけ）
-        _write_fix(fixp, cells, cfg.encoding_out)
+        _write_fix(st.path(fixp), cells, cfg.encoding_out)
         files["fix"] = str(fixp)
     ver = verify_before_after(cfg, header, rows, out_header, out_rows, issues, set(prov.corrected))
     idem = idempotency_report(cfg, header, rows) if verify else []
@@ -758,14 +828,14 @@ def convert_to_files(cfg: Config, config_path: str, input_path: str, header: lis
     groups, cover = group_issues(issues), case_coverage(cfg, header, rows)
     if detail_files:
         rep = out.with_name(out.stem + "_conv.csv")
-        write_report(rep, issues, cfg.encoding_out)
+        write_report(st.path(rep), issues, cfg.encoding_out)
         files["report"] = str(rep)
         if not no_diff:
             dp = out.with_name(out.stem + "_diff.csv")
-            _write_diff(dp, changes, cfg.encoding_out)
+            _write_diff(st.path(dp), changes, cfg.encoding_out)
             files["diff"] = str(dp)
         files["log"] = str(out.with_suffix(".log"))
-        write_log(files["log"], {"command": command, "input": input_path, "config": config_path or "(設定なし)",
+        write_log(st.path(Path(files["log"])), {"command": command, "input": input_path, "config": config_path or "(設定なし)",
                                  "config_sha": sha, "header_sha": header_sha(uh), "rows": len(out_rows),
                                  "errors": e, "warnings": len(issues) - e, "files": files, "verification": ver,
                                  "not_idempotent": idem, "lint": lint(cfg), "drift": drift, "issues": idicts,
@@ -775,8 +845,8 @@ def convert_to_files(cfg: Config, config_path: str, input_path: str, header: lis
                           rows=len(out_rows), errors=e, warnings=len(issues) - e, files=files, groups=groups,
                           coverage=cover, issues=idicts, changes=changes, verification=ver,
                           not_idempotent=idem, lint=lint(cfg), drift=drift, provenance=pv)
-    write_json(jsonp, report)
-    htmlp.write_text(render_html(report, cfg, header, rows, out_header, out_rows, issues, prov), encoding="utf-8")
+    write_json(st.path(jsonp), report)
+    st.path(htmlp).write_text(render_html(report, cfg, header, rows, out_header, out_rows, issues, prov), encoding="utf-8")
     return {"out_header": out_header, "out_rows": out_rows, "issues": issues, "idicts": idicts,
             "changes": changes, "verification": ver, "not_idempotent": idem, "drift": drift,
             "files": files, "errors": e, "warnings": len(issues) - e, "duplicates": dups,

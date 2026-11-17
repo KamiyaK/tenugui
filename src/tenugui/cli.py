@@ -9,17 +9,18 @@ import argparse
 import datetime
 import hashlib
 import json
+import os
 import re
 import sys
 from pathlib import Path
 
 from .analysis import (SHAPE_HEADER, case_coverage, compare_outputs, convert_to_files, diff_changes, draft_toml,
                        group_issues, header_drift, header_sha, idempotency_report, impact, issue_dict, lint, shape_table,
-                       lock_path, run_tests, suggest, survey_full, survey_overview, as_test_block, try_row,
+                       lock_path, output_files, run_tests, suggest, survey_full, survey_overview, as_test_block, try_row,
                        verify_before_after, verify_files, write_lock, write_log)
 from .core import (ConfigError, check_header, config_from_dict, convert_rows, did_you_mean, load_config,
                    read_csv, uniquify, write_csv, write_report)
-from .corrections import KIND_LABEL, Provenance
+from .corrections import KIND_LABEL, Provenance, corrections_path
 from .export import export_tables
 
 SCHEMA = "tenugui.{}/1"
@@ -129,8 +130,48 @@ def default_out_dir(input_path: str | Path) -> Path:
     return Path(input_path).resolve().parent / OUT_DIR_NAME
 
 
-def resolve_output(input_path: str, output: str | None, out_dir: str | None, stamp: bool) -> Path:
-    """出力CSVのパス。既定は 入力CSVのあるフォルダの tenugui_out/ 。無ければ作る。"""
+def _same_file(a: str | Path, b: str | Path) -> bool:
+    """同じファイルを指しているか（相対・絶対、.. 、リンク、大文字小文字を区別しないOSの綴り違いを含む）。"""
+    a, b = Path(a), Path(b)
+    try:
+        if a.exists() and b.exists():
+            return os.path.samefile(a, b)
+        return os.path.normcase(a.resolve()) == os.path.normcase(b.resolve())
+    except OSError:
+        return False
+
+
+def protected_files(args) -> list[tuple[str, str]]:
+    """書き出しで上書きしてはいけないファイル: 設定・訂正ファイル・列構成の記録（lock）。(呼び名, パス) のリスト。"""
+    res: list[tuple[str, str]] = []
+    cfgp = getattr(args, "config", None)
+    if cfgp:
+        res.append(("設定ファイル", cfgp))
+        res.append(("訂正ファイル", str(corrections_path(cfgp))))
+        res.append(("列構成の記録（lock）", str(lock_path(cfgp))))
+    if getattr(args, "corrections", None):
+        res.append(("訂正ファイル", args.corrections))
+    if getattr(args, "base", None):
+        res.append(("変更前の設定", args.base))
+    return res
+
+
+def guard_output(out: str | Path, protect: list[tuple[str, str]]) -> None:
+    """out に書くと protect のどれかを上書きしてしまうなら止める。"""
+    for label, path in protect:
+        if path and _same_file(out, path):
+            raise ConfigError([f"出力先が{label}と同じです: {out}。上書きしないよう、別の名前を指定してください"])
+
+
+_REPORT_SUFFIXES = (".html", ".json", ".log")
+
+
+def resolve_output(input_path: str, output: str | None, out_dir: str | None, stamp: bool,
+                   protect: list[tuple[str, str]] | None = None) -> Path:
+    """出力CSVのパス。既定は 入力CSVのあるフォルダの tenugui_out/ 。無ければ作る。
+
+    出力CSVと、同じ名前で書くレポート類（.html / .json / _fix.csv など）が、入力や protect のファイルと
+    重なるときは止める（設定エラー）。"""
     d = Path(out_dir) if out_dir else default_out_dir(input_path)
     if output:
         out = Path(output)
@@ -140,39 +181,74 @@ def resolve_output(input_path: str, output: str | None, out_dir: str | None, sta
         out = d / f"{Path(input_path).stem}_tenugui.csv"
     if stamp:
         out = out.with_name(f"{out.stem}_{datetime.datetime.now():%Y%m%d_%H%M%S}{out.suffix}")
-    try:
-        same = out.resolve() == Path(input_path).resolve()
-    except OSError:
-        same = False
-    if same:
+    if _same_file(out, input_path):
         raise ConfigError([f"出力先が入力ファイルと同じです: {out}。入力を上書きしないよう、別の名前か --out-dir を指定してください"])
+    if out.suffix.lower() in _REPORT_SUFFIXES:
+        raise ConfigError([f"出力CSVの名前に {out.suffix} は使えません: {out}。同じ名前の {' / '.join(_REPORT_SUFFIXES)} に"
+                           "レポートを書くため、CSV が上書きされてしまいます（例: -o 結果.csv）"])
+    for f in output_files(out):
+        guard_output(f, [("入力ファイル", input_path), *(protect or [])])
     out.parent.mkdir(parents=True, exist_ok=True)
     return out
+
+
+_OWN_OUTPUT = re.compile(r"^(?P<base>.+_tenugui(?:_\d{8}_\d{6})?(?:_\d+)?)(?:_fix|_conv|_diff)?$")
+
+
+def _is_own_output(p: Path) -> bool:
+    """フォルダの中の CSV が、前回の tenugui の出力か。名前の形（<名>_tenugui.csv、_fix.csv など）に加えて、
+    隣に同じ名前の JSON レポート（tenugui.report/1）があるものだけを出力とみなす。"""
+    m = _OWN_OUTPUT.match(p.stem)
+    if not m:
+        return False
+    rep = p.with_name(m.group("base") + ".json")
+    try:
+        with open(rep, encoding="utf-8") as f:
+            return '"tenugui.report/1"' in f.read(200)
+    except (OSError, UnicodeError):
+        return False
 
 
 def _inputs(args) -> list[str]:
     """convert の入力。フォルダを渡すと、その中の *.csv（tenugui_out は除く）。"""
     res: list[str] = []
+    args.skipped_outputs = []          # フォルダの中にあった前回の出力（入力にしない）
     for a in args.input:
         pa = Path(a)
         if pa.is_dir():
-            res += [str(x) for x in sorted(pa.glob("*.csv"))]
+            for x in sorted(pa.glob("*.csv")):
+                if _is_own_output(x):
+                    args.skipped_outputs.append(str(x))
+                else:
+                    res.append(str(x))
         else:
             res.append(a)
     if not res:
-        raise ConfigError([f"入力CSVがありません: {', '.join(args.input)}"])
+        raise ConfigError([f"入力CSVがありません: {', '.join(args.input)}"
+                           + ("（前回の出力とみなした CSV しかありません）" if args.skipped_outputs else "")])
     return res
 
 
-def _convert_one(args, cfg, input_path: str, batch: bool = False) -> tuple[int, dict, list[str]]:
-    """1ファイルを変換。戻り値 (終了コード, JSON用の辞書, 人向けの表示行)。"""
+def _convert_one(args, cfg, input_path: str, batch: bool = False,
+                 taken: set[str] | None = None) -> tuple[int, dict, list[str]]:
+    """1ファイルを変換。戻り値 (終了コード, JSON用の辞書, 人向けの表示行)。
+    taken は一括変換でこれまでに使った出力名。同じ名前になるときは _2, _3 を付けて、先の結果を上書きしない。"""
     header, rows = read_csv(input_path, cfg.encoding_in)
     uh, dups = uniquify(header)
     probs = check_header(cfg, uh)
     if probs:
         return 2, {"schema": SCHEMA.format("convert"), "ok": False, "input": input_path,
                    "input_problems": probs}, [f"NG {x}" for x in probs]
-    out = resolve_output(input_path, args.output, args.out_dir, args.timestamp)
+    out = resolve_output(input_path, args.output, args.out_dir, args.timestamp, protected_files(args))
+    renamed = ""
+    if taken is not None:
+        first, n = out, 2
+        while os.path.normcase(out.resolve()) in taken:
+            out = first.with_name(f"{first.stem}_{n}{first.suffix}")
+            n += 1
+        taken.add(os.path.normcase(out.resolve()))
+        if out != first:
+            renamed = f"注意: 同じ名前の出力（{first.name}）が先にあるため、{out.name} に書きました"
     r = convert_to_files(cfg, args.config, input_path, header, rows, out, no_diff=args.no_diff,
                          verify=args.verify, command="tenugui " + " ".join(sys.argv[1:]),
                          detail_files=args.detail_files, report_unused=not batch)
@@ -196,7 +272,11 @@ def _convert_one(args, cfg, input_path: str, batch: bool = False) -> tuple[int, 
          "header": {"sha": r["header_sha"], "duplicates": dups, "drift": drift}}
     if batch:
         j["_unused"] = [u["where"] for u in r["unused"]]
+    if getattr(args, "skipped_outputs", None) and not batch:
+        j["skipped_outputs"] = args.skipped_outputs
     L = [f"注意: 列名 {d!r} が重複していたため #2, #3... を付けました" for d in dups]
+    if renamed:
+        L.append(renamed)
     L += [f"{len(out_rows)} 行を変換 → {files['output']}", f"エラー {e} 件 / 警告 {w} 件"]
     L += _group_lines(groups)
     L += [f"  書式の内訳 {c['column']}: " + " / ".join(f"{x['label']} {x['count']}件" for x in c["cases"])
@@ -229,13 +309,15 @@ def cmd_convert(args) -> int:
         else:
             for x in lines:
                 print(x, file=sys.stderr if code == 2 else sys.stdout)
+            _say_skipped(args)
         return code
     if args.output:
         raise ConfigError(["-o は入力が1つのときだけ使えます（複数のときは --out-dir か既定の tenugui_out/）"])
     results, worst = [], 0
+    taken: set[str] = set()
     for inp in inputs:
         try:
-            code, j, lines = _convert_one(args, cfg, inp, batch=True)
+            code, j, lines = _convert_one(args, cfg, inp, batch=True, taken=taken)
         except (ConfigError, OSError, UnicodeError) as ex:
             code, j, lines = 2, {"schema": SCHEMA.format("convert"), "ok": False, "input": inp,
                                  "input_problems": [str(ex)]}, [f"NG {ex}"]
@@ -263,14 +345,23 @@ def cmd_convert(args) -> int:
         worst = max(worst, 1)
     if args.format == "json":
         _json({"schema": SCHEMA.format("batch"), "ok": worst == 0, "totals": tot,
-               **({"unused": unused} if cfg.corrections else {}), "results": results})
+               **({"unused": unused} if cfg.corrections else {}),
+               **({"skipped_outputs": args.skipped_outputs} if args.skipped_outputs else {}), "results": results})
     else:
         print(f"合計: {tot['files']} ファイル（変換できず {tot['failed']}）/ {tot['rows']} 行 / "
               f"エラー {tot['error']} 件 / 警告 {tot['warning']} 件"
               + (f" / 訂正 {tot['corrected']} セル / 保留 {tot['held']} セル" if cfg.corrections else ""))
         for u in unused:
             print(f"注意 {u['code']} {u['where']}: {u['message']}")
+        _say_skipped(args)
     return worst
+
+
+def _say_skipped(args) -> None:
+    sk = getattr(args, "skipped_outputs", None)
+    if sk:
+        print(f"注意: 前回の出力とみなして読み飛ばした CSV が {len(sk)} 件あります（例: {Path(sk[0]).name}）。"
+              "入力として変換したいときは、ファイルを名前で指定してください")
 
 
 def cmd_verify(args) -> int:
@@ -297,6 +388,7 @@ def cmd_survey(args) -> int:
         if args.column:
             print("survey -o は概況（-k なし）だけで使えます", file=sys.stderr)
             return 2
+        guard_output(args.output, [("入力ファイル", args.input), *protected_files(args)])
         files = export_tables(args.output, [("形", SHAPE_HEADER, shape_table(cfg, header, rows, args.all))])
         if args.format == "json":
             _json({"schema": SCHEMA.format("export"), "files": [str(f) for f in files]})
@@ -349,6 +441,7 @@ def cmd_draft(args) -> int:
         print(text)
         return 0
     out = Path(args.output) if args.output else default_out_dir(args.input) / "draft.toml"
+    guard_output(out, [("入力ファイル", args.input), *protected_files(args)])
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(text, encoding="utf-8")
     print(f"下書きを書きました → {out}（check で検証してから使ってください）")
