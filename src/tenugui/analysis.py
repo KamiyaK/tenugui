@@ -748,6 +748,10 @@ class _Staged:
         self.pairs.append((tmp, final))
         return tmp
 
+    def path_of(self, final: Path) -> Path:
+        """もう書いた仮のファイル（final の書きかけ）。"""
+        return next(t for t, f in self.pairs if f == final)
+
     def commit(self) -> None:
         try:
             for tmp, final in self.pairs:
@@ -845,6 +849,8 @@ def _write_outputs(st: _Staged, cfg: Config, config_path: str, input_path: str, 
                           rows=len(out_rows), errors=e, warnings=len(issues) - e, files=files, groups=groups,
                           coverage=cover, issues=idicts, changes=changes, verification=ver,
                           not_idempotent=idem, lint=lint(cfg), drift=drift, provenance=pv)
+    # 出力CSVの指紋。後段（design_erc）は、CSV がこのレポートの後に書き換えられていないかをこれで確かめる
+    report["output_sha256"] = hashlib.sha256(st.path_of(out).read_bytes()).hexdigest()
     write_json(st.path(jsonp), report)
     st.path(htmlp).write_text(render_html(report, cfg, header, rows, out_header, out_rows, issues, prov), encoding="utf-8")
     return {"out_header": out_header, "out_rows": out_rows, "issues": issues, "idicts": idicts,
