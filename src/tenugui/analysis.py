@@ -485,6 +485,9 @@ _DRAFT_MAX_CASES = 8        # 複合表記の case 下書きに載せる形の�
 _DRAFT_TRY_MAX = 500       # 下書きを試すときの値の種類の上限（多い順）
 _DRAFT_TEXT_CASE_MAX = 10   # 複合表記の列に混ざる文字だけの値を、match の case にする上限
 _MERGED_KEYS = (["元ファイル", "シート名"], ["Source file", "Sheet"])   # chozu --merge の先頭2列
+# chozu がセクションごとに付ける補助列（未取得の項目名・未使用セル）。設計値ではないので下書きに入れない。
+# 同じ名前が複数あると読み込み時に #2, #3 が付く。design_erc の ignore_columns の既定と同じ
+_CHOZU_AUX = re.compile(r"missing_info\d*(#\d+)?")
 
 
 def _key_columns(uh: list[str]) -> int:
@@ -686,7 +689,7 @@ def draft_toml(cfg: Config, header: list[str], rows: list[list[str]]) -> str:
     index: list[str] = []
     taken = set(uh)
     for i, col in enumerate(uh):
-        if i < nkey:
+        if i < nkey or _CHOZU_AUX.fullmatch(col):
             continue
         vals = Counter(normalize_text(r[i]) for r in rows if i < len(r))
         vals = Counter({v: n for v, n in vals.items() if v and not _is_reserved(cfg, v)})
@@ -748,7 +751,7 @@ def draft_toml(cfg: Config, header: list[str], rows: list[list[str]]) -> str:
     counts = Counter(line.split(": ", 1)[1].split(" — ")[0] for line in index)
     head = ("# tenugui draft — 自動生成の下書き。そのまま使わず、内容を確認して check で検証すること\n"
             f"# 列ごとの結果（{len(index)} 列: ルール {counts['ルール']} / 要確認 {counts['要確認']} / "
-            f"ルールなし {counts['ルールなし']}。空と抽出NG印だけの列は除く）\n"
+            f"ルールなし {counts['ルールなし']}。空と抽出NG印だけの列・chozu の補助列 missing_info は除く）\n"
             + "".join(l + "\n" for l in index) + "schema_version = 1\n\n")
     return head + "".join(b + "\n" for b in syn_blocks) + "".join(b + "\n" for b in field_blocks) \
         + ("\n".join(notes) + "\n" if notes else "")
