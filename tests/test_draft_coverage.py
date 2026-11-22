@@ -127,3 +127,14 @@ def test_chozu_merged_layout_skips_both_key_columns():
     rows = [["a.xlsx", "P001", "40mm"], ["a.xlsx", "P002", "4cm"], ["A.XLSX", "P001", "41"]]
     text, cfg = _draft(h, rows)
     assert [f.src for f in cfg.fields] == ["外径"] and "synonyms" not in text
+
+
+def test_chozu_missing_info_columns_are_left_out():
+    """chozu の補助列 missing_info0 / missing_info1（重複して #2 が付いたものも）には下書きを作らない。"""
+    h = ["シート名", "外径", "missing_info0", "missing_info1", "幅", "missing_info0", "missing_info1"]
+    rows = [["P1", "40mm", "外径/幅", "B3", "10mm", "", "C5"],
+            ["P2", "4cm", "外径", "b3", "11", "幅", "c5"],
+            ["P3", "41", "外径/幅", "B3", "12mm", "", ""]]
+    text, cfg = _draft(h, rows)
+    assert [f.src for f in cfg.fields] == ["外径", "幅"]
+    assert "missing_info" not in "".join(_index(text)) and not cfg.synonyms
