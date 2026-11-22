@@ -3,6 +3,12 @@
 書き方は [Keep a Changelog](https://keepachangelog.com/ja/1.1.0/) に、版番号は [セマンティック バージョニング](https://semver.org/lang/ja/) に沿う。
 1.0.0 までは、設定ファイル（`schema_version = 1`）の既存の書き方の意味は変えない方針。
 
+## [0.14.1] - 2026-11-23
+
+### 変更
+- chozu の補助列 `missing_info0` / `missing_info1`（重複して `#2` が付いたものも）には下書きを作らない
+  （設計値ではない。design_erc の `ignore_columns` の既定と同じ範囲）
+
 ## [0.14.0] - 2026-11-23
 
 `draft`（ルールの下書き）が、空と抽出NG印だけの列を除くすべての列について、確からしいものをできるだけ作るようにした。
