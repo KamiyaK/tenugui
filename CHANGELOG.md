@@ -3,6 +3,14 @@
 書き方は [Keep a Changelog](https://keepachangelog.com/ja/1.1.0/) に、版番号は [セマンティック バージョニング](https://semver.org/lang/ja/) に沿う。
 1.0.0 までは、設定ファイル（`schema_version = 1`）の既存の書き方の意味は変えない方針。
 
+## [0.15.0] - 2026-11-23
+
+### 追加
+- `[settings] ignore_columns`: `draft` と `survey`（UI の「形を集計」も）の対象から外す列を、列名に全体一致する正規表現で書く。
+  既定は chozu の補助列 `missing_info\d*(#\d+)?`（0.14.1 で draft に入れていた決め打ちを設定にした。design_erc の `[meta] ignore_columns` の既定と同じ）。
+  書くと既定を置き換える。変換の結果は変わらない（ルールが無ければそのまま通る）
+- lint L501: `ignore_columns` に当たる列に field がある（変換はするが、集計には出ない）
+
 ## [0.14.1] - 2026-11-23
 
 ### 変更

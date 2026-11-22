@@ -1,6 +1,6 @@
 # Tenugui AGENT_REFERENCE（agent向け・機械向けの仕様）
 
-動機や比喩は書かない。人向けは README.md。バージョン 0.14.1 / schema_version = 1。
+動機や比喩は書かない。人向けは README.md。バージョン 0.15.0 / schema_version = 1。
 
 ## 0. 不変条件
 - I1 決定的: 同じ入力・同じ設定なら同じ出力。乱数・時刻・ネットワークを使わない
@@ -23,7 +23,7 @@
 - 数値のあとの残り全部を単位として読む。`4(二重)` は C103。`match` で分ける
 
 ## 2. キー表
-`[settings]` `encoding_in`(utf-8-sig) `encoding_out`(utf-8-sig) `passthrough`(true) `keep`([]) `reserved`(['^NG\d*$']) `on_error`(keep|empty) `rare_shape`(0.05。C131 の閾値、0 で無効) `null_values`([]。空として扱う値)
+`[settings]` `encoding_in`(utf-8-sig) `encoding_out`(utf-8-sig) `passthrough`(true) `keep`([]) `reserved`(['^NG\d*$']) `on_error`(keep|empty) `rare_shape`(0.05。C131 の閾値、0 で無効) `null_values`([]。空として扱う値) `ignore_columns`(['missing_info\d*(#\d+)?']。draft・survey の対象外の列。列名に全体一致。書くと既定を置き換える)
 
 `[units.<次元>]` `base`=基準単位、`単位 = 倍率`（文字列可: `inch = "25.4"`）。式定義: `"°C" = { to_base = "x + 273.15", from_base = "x - 273.15" }`（変数は x のみ、base は倍率で定義された単位）
 既定の次元: length mm / voltage V / current A / resistance Ω / power W / mass g / time s / pressure Pa / frequency Hz / ratio % / temperature K(°C, °F は式)
@@ -150,6 +150,7 @@ JSON: `convert` の `verification:{ok,summary,violations[]}`、`verify` は `{sc
 | L101 | W(lint) | 置換列が単位なし出力で default_unit なし → 再実行で C102 | default_unit を足す |
 | L102 | W | `--verify`/`--idempotent` で再実行すると値が変わる列 | 設定を直す |
 | L201 | W(lint) | 未使用の同義語表 | 削除または field から参照 |
+| L501 | W(lint) | `ignore_columns` に当たる列に field がある（変換はする） | 設計値なら ignore_columns から外す。補助列なら field を消す |
 | L401 | W(lint) | `match` / `extract` の正規表現に繰り返しの入れ子（`(a+)+`、`(\d*)*`）。一致しない値で極端に遅くなる | 内側か外側の繰り返しを外す（`(\d+)+` → `\d+`） |
 | C003 | W | lock と列構成が違う（増/減） | 意図した変更なら `tenugui lock` で再記録 |
 | L301 | W | 当たらなかった訂正 | 元データが直ったなら `[[correct]]` を消す。違うなら column / value の綴りを確認 |
@@ -164,7 +165,7 @@ JSON: `convert` の `verification:{ok,summary,violations[]}`、`verify` は `{sc
 - `tenugui try -c R --field 列 値 [--set 列=値 ...]` → CSVなしで1行試す。`{schema:"tenugui.try/1", ok, outputs{}, issues[], trace{出力列:[{stage,value}]}, skipped_fields[], skipped_derives[]}`。stage: null / case / normalize / sub / synonyms / extract / number_only / quantity / format / reserved
 - `tenugui survey IN -k 列 [-k 列...] [-c R] --format json` → `{columns:[{column,distinct,top_values[{value,count}],units{},unparsable,candidates[{canonical,variants[],kind:exact|similar,count}],composite_examples[]}]}`
 - `tenugui verify IN OUT_CSV -c R [--format json] [--fail-on ...(既定error)]`
-- `tenugui draft IN [-c R] [-o draft.toml(既定 tenugui_out/draft.toml)] [--stdout]` → 実態から作る下書き。列ごとに 数量（値の5割以上が数値＋既知の単位。最頻の単位に `to`）→ 複合表記（2つ以上の数値・±×～~ を含む値が2割以上。preset tolerance/tolerance_range/range か、形ごとの `[[field.case]]`）→ 表記ゆれ（`[synonyms.<列名>]`。exact と similar の両方。英数字だけ違う値 SUS304/SUS304L は束ねない。値が50種類以下なら全値を表に載せ `on_unknown="warn"`、多ければ `"keep"`）の順に1つ作る。作った下書きは今のデータで変換してみて `# 試行:` にエラー・警告の件数を書く。冒頭の `#   列: ルール|要確認|ルールなし — 理由` が全列の一覧（空と抽出NG印だけの列を除く）。`要確認` は similar を束ねた・数値の出力列名を位置で付けた（`<列>_n1`、数値の個数が違う形は `<列>_<k>値_n1`。単位で区別できれば `<列>_<単位>`）・そろえられない単位がある・試行で問題が出た のどれか。chozu の結合出力（先頭が 元ファイル, シート名）は2列ともキーとして扱う。chozu の補助列 `missing_info\d*`（重複で `#2` が付いたものも）は対象外。**下書きは必ず `check` と `try` で検証してから使う**
+- `tenugui draft IN [-c R] [-o draft.toml(既定 tenugui_out/draft.toml)] [--stdout]` → 実態から作る下書き。列ごとに 数量（値の5割以上が数値＋既知の単位。最頻の単位に `to`）→ 複合表記（2つ以上の数値・±×～~ を含む値が2割以上。preset tolerance/tolerance_range/range か、形ごとの `[[field.case]]`）→ 表記ゆれ（`[synonyms.<列名>]`。exact と similar の両方。英数字だけ違う値 SUS304/SUS304L は束ねない。値が50種類以下なら全値を表に載せ `on_unknown="warn"`、多ければ `"keep"`）の順に1つ作る。作った下書きは今のデータで変換してみて `# 試行:` にエラー・警告の件数を書く。冒頭の `#   列: ルール|要確認|ルールなし — 理由` が全列の一覧（空と抽出NG印だけの列を除く）。`要確認` は similar を束ねた・数値の出力列名を位置で付けた（`<列>_n1`、数値の個数が違う形は `<列>_<k>値_n1`。単位で区別できれば `<列>_<単位>`）・そろえられない単位がある・試行で問題が出た のどれか。chozu の結合出力（先頭が 元ファイル, シート名）は2列ともキーとして扱う。`[settings] ignore_columns` に当たる列（既定は chozu の補助列 `missing_info\d*`、重複で `#2` が付いたものも）は対象外。**下書きは必ず `check` と `try` で検証してから使う**
 - `tenugui survey IN [--all] --format json`（`-k` なし）→ 全列の概況 `{schema:"tenugui.survey_overview/1", rows, columns:[{column, filled, ng, distinct, shape_count, shapes[{shape,count,distinct,examples[]}]}]}`。既定は数値を含み形が2種類以上の列だけ。`-k 列` の結果にも `shapes[]` が入る
 - `tenugui survey IN [--all] [-c R] -o FILE` → 概況を表（列, 形の種類, 件数, 形, 例。列名・種類数は各列の先頭行だけ）で書き出す。拡張子 `.xlsx` なら Excel、それ以外は CSV（utf-8-sig）。`--format json` で `{schema:"tenugui.export/1", files[]}`。`-k` と併用は終了コード 2。agent が形を読むなら `--format json`（`-o` なし）のほうが扱いやすい
 - convert の JSON に追加: `issue_groups[{column,out,code,severity,shape,count,examples[],rows[],message,hint}]`（件数順）, `case_coverage[{column,cases[{case,label,count}],unmatched,empty,ng}]`。**大きなCSVでは `--max-issues 0` を付け、`issue_groups` だけ読む**

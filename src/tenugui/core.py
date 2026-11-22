@@ -22,7 +22,11 @@ from .units import (UnitError, UnitTable, fold_key, format_decimal, squash_ws,
 
 SCHEMA_VERSION = 1
 
-_SETTINGS_KEYS = {"encoding_in", "encoding_out", "passthrough", "keep", "reserved", "on_error", "rare_shape", "null_values"}
+_SETTINGS_KEYS = {"encoding_in", "encoding_out", "passthrough", "keep", "reserved", "on_error", "rare_shape", "null_values",
+                  "ignore_columns"}
+# 下書き・集計の対象から外す列（列名に全体一致）。既定は chozu がセクションごとに付ける補助列（未取得の項目名・未使用セル）。
+# 同じ名前が複数あると読み込み時に #2, #3 が付く。design_erc の [meta] ignore_columns の既定と同じ
+DEFAULT_IGNORE_COLUMNS = [r"missing_info\d*(#\d+)?"]
 MAX_VALUE_CHARS = 2000         # これより長い値は、数値や書式として照合しない（C101 / C111）
 RARE_SHAPE_MIN_ROWS = 20      # 少数派の形(C131)を調べるのに必要な、値のある行数
 _FIELD_KEYS = {"src", "out", "drop_src", "required", "sub", "synonyms", "on_unknown",
@@ -252,6 +256,8 @@ class Config:
     null_keys: frozenset = frozenset()   # 空として扱う値（[settings] null_values を NFKC・大小無視にしたもの）
     synonym_tables: dict[str, dict[str, list[str]]] = field(default_factory=dict)   # 書かれたままの同義語表（用語対応表用）
     corrections: Corrections | None = None    # 訂正・保留（別ファイル）。無ければ None
+    ignore_columns: list[re.Pattern] = field(
+        default_factory=lambda: [re.compile(x) for x in DEFAULT_IGNORE_COLUMNS])   # 下書き・集計の対象外の列
 
 
 def _unknown(prefix: str, d: dict, allowed: set[str], problems: list[str]) -> None:
@@ -561,7 +567,7 @@ _PART_T = {**_VALUE_T, "unit_group": _T_STR_OR_STRS}
 _DERIVE_T = {"out": _T_NAME, "expr": _T_STR, "vars": _T_STRMAP, "unit": _T_NAME, "to": _T_NAME, "unit_out": _T_STR,
              "decimals": _T_DEC, "trim": _T_BOOL, "after": _T_STR}
 _SETTINGS_T = {"encoding_in": _T_NAME, "encoding_out": _T_NAME, "passthrough": _T_BOOL, "keep": _T_STRS,
-               "reserved": _T_STRS, "on_error": _T_STR}
+               "reserved": _T_STRS, "on_error": _T_STR, "ignore_columns": _T_STRS}
 
 
 def _type_problems(raw) -> list[str]:
@@ -701,6 +707,12 @@ def _config_from_dict(raw: dict, corrections: dict | None = None) -> Config:
                      "扱われ、何も変換されなくなります（'^NG\\d*$' のように、印の形を書きます）")
             continue
         reserved.append(rx)
+    ignore_columns = []
+    for pat in st.get("ignore_columns", DEFAULT_IGNORE_COLUMNS):
+        try:
+            ignore_columns.append(re.compile(pat))
+        except re.error as e:
+            p.append(f"[settings] ignore_columns の正規表現が不正: {pat!r} ({e})")
     for key in ("encoding_in", "encoding_out"):
         if isinstance(st.get(key), str):
             try:
@@ -867,7 +879,7 @@ def _config_from_dict(raw: dict, corrections: dict | None = None) -> Config:
         p.extend(cp)
     if p:
         raise ConfigError(p)
-    return Config(corrections=cor, synonym_tables=synonym_tables, null_keys=frozenset(null_key(x) for x in nulls), rare_shape=float(rare), tests=tests, units=units, fields=fields, derives=derives, synonyms=synonyms,
+    return Config(ignore_columns=ignore_columns, corrections=cor, synonym_tables=synonym_tables, null_keys=frozenset(null_key(x) for x in nulls), rare_shape=float(rare), tests=tests, units=units, fields=fields, derives=derives, synonyms=synonyms,
                   encoding_in=st.get("encoding_in", "utf-8-sig"),
                   encoding_out=st.get("encoding_out", "utf-8-sig"),
                   passthrough=bool(st.get("passthrough", True)),
@@ -938,6 +950,11 @@ def null_key(s: str) -> str:
 def is_null(cfg: Config, s: str) -> bool:
     """[settings] null_values にある値か（「-」「なし」など、空と同じ意味の値）。"""
     return bool(cfg.null_keys) and null_key(s) in cfg.null_keys
+
+
+def is_ignored_column(cfg: Config, name: str) -> bool:
+    """[settings] ignore_columns に当たる列か（下書き・集計の対象外。変換ではルールが無ければそのまま通る）。"""
+    return any(r.fullmatch(name) for r in cfg.ignore_columns)
 
 
 def _is_reserved(cfg: Config, s: str) -> bool:

@@ -11,7 +11,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from .core import (PRESETS, Config, ConfigError, FieldRule, Issue, _apply_field, _is_reserved, check_header, compile_pattern,
-                   config_from_dict, is_null,
+                   config_from_dict, is_ignored_column, is_null,
                    convert_rows, select_case, shape_of, survey as _survey, uniquify)
 from .corrections import KIND_LABEL, Provenance, summarize, unused_entries
 from .units import UnitError, UnitTable, fold_key, normalize_text, parse_quantity
@@ -27,6 +27,7 @@ HINTS = {
     "C111": "書式が外れた。tenugui suggest で追加すべき case の案を得るか、tenugui try で値を試す",
     "C131": "変換はできたが形が少数派（単位なし・桁区切り・書き方違いなど）。正しければそのままでよい。"
             "別の書式なら case を足す。警告が不要なら [settings] rare_shape = 0",
+    "L501": "設計値の列なら [settings] ignore_columns から外す。補助の列なら field を消す",
     "L401": "正規表現の繰り返しを入れ子にしない。(\\d+)+ は \\d+ と同じ意味で、ずっと速い",
     "C121": "同義語表に無い値。[synonyms.*] に追加するか on_unknown を見直す（survey の candidates 参照）",
     "C141": "訂正ファイルの [[hold]]（保留）に当たった値。変換せず元の値のまま通している。"
@@ -68,6 +69,11 @@ def lint(cfg: Config) -> list[dict]:
                 out.append({"code": "L401", "where": fr.src,
                             "message": f"{what} の正規表現 {pat!r} に、繰り返しの中の繰り返し（(a+)+ の形）があります。"
                                        "一致しない値で処理が止まったように遅くなることがあります。内側か外側の繰り返しを外してください"})
+    for src in dict.fromkeys(fr.src for fr in cfg.fields):
+        if is_ignored_column(cfg, src):
+            out.append({"code": "L501", "where": src,
+                        "message": "[settings] ignore_columns に当たる列に field があります。変換はするが、"
+                                   "draft・survey の集計には出ません"})
     used = {fr.synonyms for fr in cfg.fields if fr.synonyms}
     for name in cfg.synonyms:
         if name not in used:
@@ -226,6 +232,8 @@ def survey_overview(cfg: Config, header: list[str], rows: list[list[str]], top: 
     uh, _ = uniquify(header)
     res = []
     for i, col in enumerate(uh):
+        if is_ignored_column(cfg, col):
+            continue
         vals = Counter(normalize_text(r[i]) for r in rows if i < len(r))
         ng = sum(n for v, n in vals.items() if v and _is_reserved(cfg, v))
         vals = Counter({v: n for v, n in vals.items() if v and not _is_reserved(cfg, v)})
@@ -485,9 +493,6 @@ _DRAFT_MAX_CASES = 8        # 複合表記の case 下書きに載せる形の�
 _DRAFT_TRY_MAX = 500       # 下書きを試すときの値の種類の上限（多い順）
 _DRAFT_TEXT_CASE_MAX = 10   # 複合表記の列に混ざる文字だけの値を、match の case にする上限
 _MERGED_KEYS = (["元ファイル", "シート名"], ["Source file", "Sheet"])   # chozu --merge の先頭2列
-# chozu がセクションごとに付ける補助列（未取得の項目名・未使用セル）。設計値ではないので下書きに入れない。
-# 同じ名前が複数あると読み込み時に #2, #3 が付く。design_erc の ignore_columns の既定と同じ
-_CHOZU_AUX = re.compile(r"missing_info\d*(#\d+)?")
 
 
 def _key_columns(uh: list[str]) -> int:
@@ -689,7 +694,7 @@ def draft_toml(cfg: Config, header: list[str], rows: list[list[str]]) -> str:
     index: list[str] = []
     taken = set(uh)
     for i, col in enumerate(uh):
-        if i < nkey or _CHOZU_AUX.fullmatch(col):
+        if i < nkey or is_ignored_column(cfg, col):
             continue
         vals = Counter(normalize_text(r[i]) for r in rows if i < len(r))
         vals = Counter({v: n for v, n in vals.items() if v and not _is_reserved(cfg, v)})
@@ -751,7 +756,7 @@ def draft_toml(cfg: Config, header: list[str], rows: list[list[str]]) -> str:
     counts = Counter(line.split(": ", 1)[1].split(" — ")[0] for line in index)
     head = ("# tenugui draft — 自動生成の下書き。そのまま使わず、内容を確認して check で検証すること\n"
             f"# 列ごとの結果（{len(index)} 列: ルール {counts['ルール']} / 要確認 {counts['要確認']} / "
-            f"ルールなし {counts['ルールなし']}。空と抽出NG印だけの列・chozu の補助列 missing_info は除く）\n"
+            f"ルールなし {counts['ルールなし']}。空と抽出NG印だけの列・ignore_columns の列は除く）\n"
             + "".join(l + "\n" for l in index) + "schema_version = 1\n\n")
     return head + "".join(b + "\n" for b in syn_blocks) + "".join(b + "\n" for b in field_blocks) \
         + ("\n".join(notes) + "\n" if notes else "")
