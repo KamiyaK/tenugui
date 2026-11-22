@@ -122,6 +122,8 @@ parts = { nom = "wire{n}_len_nom", tol = "wire{n}_len_tol" }      # 部品名 = 
 
 **空として扱う値** — `[settings] null_values = ["-", "なし", "未定"]`。ルールのかかった列で、これらの値を空と同じに扱う（全角半角・大小は無視、完全一致）。ルールのない列は変えない。
 
+**下書き・集計から外す列** — `[settings] ignore_columns = ['missing_info\d*(#\d+)?', 'メモ']`。列名に全体一致する正規表現で書く。当たった列は `draft` と `survey`（UI の「形を集計」も）に出ない。変換ではルールが無ければそのまま通る。既定は chozu がセクションごとに付ける補助列 `missing_info0` / `missing_info1`（重複して `#2` が付いたものも含む。design_erc の既定と同じ）。書くと既定を置き換えるので、補助列も外すなら既定の式も一緒に書く。
+
 **フォルダ一括** — `tenugui convert フォルダ -c rules.toml` で、中の `*.csv` を全部変換する。ファイルを複数並べてもよい。最後に合計を出す。
 
 **設定の書き方を出す** — `tenugui schema`（agent 向けは `--format json`）。キー・型・既定値・併用できないキー・preset の部品名・報告コードの一覧。
