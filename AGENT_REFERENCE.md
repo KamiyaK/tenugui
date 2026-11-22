@@ -1,6 +1,6 @@
 # Tenugui AGENT_REFERENCE（agent向け・機械向けの仕様）
 
-動機や比喩は書かない。人向けは README.md。バージョン 0.14.0 / schema_version = 1。
+動機や比喩は書かない。人向けは README.md。バージョン 0.14.1 / schema_version = 1。
 
 ## 0. 不変条件
 - I1 決定的: 同じ入力・同じ設定なら同じ出力。乱数・時刻・ネットワークを使わない
