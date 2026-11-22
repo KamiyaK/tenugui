@@ -10,7 +10,8 @@ from collections import Counter
 from dataclasses import replace
 from pathlib import Path
 
-from .core import (Config, ConfigError, FieldRule, Issue, _apply_field, _is_reserved, check_header, compile_pattern, is_null,
+from .core import (PRESETS, Config, ConfigError, FieldRule, Issue, _apply_field, _is_reserved, check_header, compile_pattern,
+                   config_from_dict, is_null,
                    convert_rows, select_case, shape_of, survey as _survey, uniquify)
 from .corrections import KIND_LABEL, Provenance, summarize, unused_entries
 from .units import UnitError, UnitTable, fold_key, normalize_text, parse_quantity
@@ -479,54 +480,276 @@ def _c(s) -> str:
     return re.sub(r"[\x00-\x1f\x7f\u0085\u2028\u2029]", " ", str(s))
 
 
+_DRAFT_VOCAB_MAX = 50       # 値の種類がこれ以下なら、同義語表に今の値をすべて載せる（新しい値だけ警告になる）
+_DRAFT_MAX_CASES = 8        # 複合表記の case 下書きに載せる形の数
+_DRAFT_TRY_MAX = 500       # 下書きを試すときの値の種類の上限（多い順）
+_DRAFT_TEXT_CASE_MAX = 10   # 複合表記の列に混ざる文字だけの値を、match の case にする上限
+_MERGED_KEYS = (["元ファイル", "シート名"], ["Source file", "Sheet"])   # chozu --merge の先頭2列
+
+
+def _key_columns(uh: list[str]) -> int:
+    """先頭から何列がキー（行の名前）か。chozu の結合出力は 元ファイル・シート名 の2列。"""
+    return 2 if uh[:2] in _MERGED_KEYS else 1
+
+
+def _numbers_in(v: str) -> int:
+    return len(re.findall(r"\d+(?:[.,]\d+)*", v))
+
+
+def _alnum_only_diff(a: str, b: str) -> bool:
+    """a と b の違いが英数字だけ（SUS304 と SUS304L、P100 と P100A など）。品番・規格の違いのことが多い。"""
+    sm = difflib.SequenceMatcher(None, a, b)
+    diff = "".join(a[i1:i2] + b[j1:j2] for op, i1, i2, j1, j2 in sm.get_opcodes() if op != "equal")
+    return bool(diff) and all(ch.isascii() and ch.isalnum() for ch in diff)
+
+
+def _draft_try(cfg: Config, key: str, col: str, pairs: list[list[str]], text: str) -> dict | None:
+    """下書きの1列分を、今のデータで実際に変換してみる。読めない下書きなら None。"""
+    try:
+        import tomllib
+        sc = config_from_dict({"schema_version": 1, **tomllib.loads(text)})
+    except Exception:
+        return None
+    # 少数派の形(C131)は件数で決まる注意で、ルールの当たり外れではないので数えない
+    ev = replace(cfg, fields=sc.fields, derives=[], synonyms=sc.synonyms, synonym_tables=sc.synonym_tables,
+                 tests=[], corrections=None, rare_shape=0)
+    distinct = Counter(v for _, v in pairs if v.strip())        # 同じ値の結果は同じなので、値の種類ごとに1回だけ変換する
+    vals = [v for v, _ in distinct.most_common(_DRAFT_TRY_MAX)]
+    _, _, iss = convert_rows(ev, [key, col], [[str(n), v] for n, v in enumerate(vals, start=1)])
+    err = sum(distinct[vals[i.row - 1]] for i in iss if i.severity == "E")
+    warn = sum(distinct[vals[i.row - 1]] for i in iss if i.severity != "E")
+    ex = list(dict.fromkeys(i.raw for i in iss if i.raw))[:3]
+    return {"errors": err, "warnings": warn, "examples": ex,
+            "sampled": len(distinct) > _DRAFT_TRY_MAX}
+
+
+def _tried(res: dict | None) -> str:
+    if res is None:
+        return "# 試行: この下書きは設定として読めませんでした（要確認）\n"
+    scope = f"多い順 {_DRAFT_TRY_MAX} 種類の値" if res["sampled"] else "このデータ"
+    if not res["errors"] and not res["warnings"]:
+        return f"# 試行: {scope}では問題なし\n"
+    ex = f" 例 {_c(res['examples'])}" if res["examples"] else ""
+    return f"# 試行: {scope}でエラー {res['errors']} 件・警告 {res['warnings']} 件（要確認）{_c(ex)}\n"
+
+
+def _out_name(col: str, part: str, taken: set[str]) -> str:
+    base = f"{col}_{part}"
+    name, k = base, 2
+    while name in taken:
+        name, k = f"{base}_{k}", k + 1
+    taken.add(name)
+    return name
+
+
+def _draft_quantity(cfg, col, vals, total):
+    """数値＋単位の列。(本文, 要確認の理由) か None。"""
+    units: Counter = Counter()
+    parsed = 0
+    for v, n in vals.items():
+        try:
+            _, u = parse_quantity(v, cfg.units)
+            parsed += n
+            if u:
+                units[u] += n
+        except UnitError:
+            pass
+    known = {u: n for u, n in units.items() if cfg.units.known(u)}
+    if not known or parsed / total < 0.5:
+        return None
+    to = max(known, key=known.get)
+    odd = [u for u in units if not (cfg.units.known(u) and cfg.units.same_dim(u, to))]
+    why = []
+    if parsed < total:
+        why.append(f"数値として読めない値が {total - parsed} 件")
+    if odd:
+        why.append(f"{to} にそろえられない単位 {', '.join(odd)}")
+    body = (f"[[field]]\nsrc = {_q(col)}\nto = {_q(to)}\ndefault_unit = {_q(to)}   # 単位なしの値は{_c(to)}とみなす\n"
+            f"# 検出された単位: {_c(', '.join(f'{u}×{n}' for u, n in units.most_common()))}\n")
+    return body, why, f"数量（{to} にそろえる）"
+
+
+def _draft_synonyms(col, vals):
+    """表記ゆれの列。(同義語表, field, 要確認の理由, 注記) か None。"""
+    groups: list[tuple[str, list[str], str]] = []      # (正しい表記, ゆれ, exact/similar)
+    notes: list[str] = []
+    for c in synonym_candidates(vals):
+        members = [c["canonical"], *c["variants"]]
+        buckets: dict[str, list[str]] = {}
+        for v in members:
+            buckets.setdefault(fold_key(v), []).append(v)
+        ck = fold_key(c["canonical"])
+        main = list(buckets.pop(ck))
+        for k, vs in buckets.items():
+            if _alnum_only_diff(ck, k):      # 英数字だけの違いは別物とみなし、束ねない
+                canon = max(vs, key=lambda v: (vals[v], -len(v)))
+                groups.append((canon, [v for v in vs if v != canon], "exact"))
+                notes.append(_c(f"# {col}: {canon!r} は {c['canonical']!r} と似ているが、英数字だけの違いなので別物として扱った"))
+            else:
+                main += vs
+        canon = max(main, key=lambda v: (vals[v], -len(v)))
+        kind = "exact" if len({fold_key(v) for v in main}) == 1 else "similar"
+        groups.append((canon, [v for v in main if v != canon], kind))
+    groups = [g for g in groups if g[1]] + [g for g in groups if not g[1]]
+    if not any(g[1] for g in groups):
+        return None
+    listed = {v for g in groups if g[1] for v in (g[0], *g[1])}
+    vocab = len(vals) <= _DRAFT_VOCAB_MAX
+    lines = []
+    for canon, vs, kind in groups:
+        if not vs:
+            continue
+        mark = "要確認・似ている表記" if kind == "similar" else "大小・全半角・空白・ハイフン違い"
+        lines.append(f"{_q(canon)} = [{', '.join(_q(v) for v in vs)}]   # {mark}・{sum(vals[v] for v in (canon, *vs))}件\n")
+    if vocab:
+        rest = sorted((v for v in vals if v not in listed), key=lambda v: -vals[v])
+        lines += [f"{_q(v)} = []\n" for v in rest]
+    table = f"[synonyms.{_q(col)}]\n" + "".join(lines)
+    on_unknown = "warn" if vocab else "keep"
+    note = ("   # 今のデータの値をすべて表に載せた。新しい値が出たら警告" if vocab
+            else f"   # 値が {len(vals)} 種類と多いので、表に無い値はそのまま通す")
+    field = f"[[field]]\nsrc = {_q(col)}\nsynonyms = {_q(col)}\non_unknown = \"{on_unknown}\"{note}\n"
+    sim = [g for g in groups if g[2] == "similar"]
+    why = [f"似ている表記を {len(sim)} 組まとめた（同じものか確認）"] if sim else []
+    return table, field, why, notes, "表記ゆれ（同義語表）"
+
+
+def _composite_candidates(cfg, col, vals, taken_base):
+    """複合表記の列の候補（本文, 種類）。preset を先に、形ごとの case を後に。"""
+    cands = []
+    for name, (rx, groups) in PRESETS.items():
+        parts = ", ".join(f"{g} = {_q(_out_name(col, g, set(taken_base)))}" for g in groups)
+        cands.append((f"[[field]]\nsrc = {_q(col)}\npreset = {_q(name)}\nparts = {{ {parts} }}\n",
+                      f"複合表記（preset {name}）", []))
+    by: dict[str, Counter] = {}
+    for v, n in vals.items():
+        by.setdefault(shape_of(v), Counter())[v] += n
+    shapes = sorted(by, key=lambda sh: -sum(by[sh].values()))
+    taken = set(taken_base)
+    outs: dict[tuple, str] = {}
+    cases, left, texts = [], [], []
+    positional = False
+    main_count = next((sh.count("#") for sh in shapes if "#" in sh), 0)
+    for sh in shapes:
+        exs = [v for v, _ in by[sh].most_common()]
+        if "#" not in sh:
+            texts += exs
+            continue
+        pat = _pattern_for(sh, exs[:20]) if len(cases) < _DRAFT_MAX_CASES else None
+        if not pat:
+            left.append(sh)
+            continue
+        pattern, names = pat
+        units = re.findall(r"#\s*([^\s#±+\-/()~〜.,\d\[\]{}]*)", sh)
+        by_unit = len(units) == len(names) and all(units) and len(set(units)) == len(units)
+        parts = []
+        for k, n in enumerate(names):
+            # 単位で区別できる数値は単位の名前で、できない数値は「数値の個数・左からの順」で出力列を分ける。
+            # 個数の違う形（±0.1 と 10±0.2）の1つ目を同じ列に入れると、意味の違う数値が混ざる
+            if by_unit:
+                key, label = ("u", units[k]), units[k]
+            else:
+                positional = True
+                cnt = len(names)
+                key = ("p", cnt, k)
+                label = f"n{k + 1}" if cnt == main_count else f"{cnt}値_n{k + 1}"
+            if key not in outs:
+                outs[key] = _out_name(col, label, taken)
+            parts.append(f"{n} = {_q(outs[key])}")
+        parts = ", ".join(parts)
+        cases.append(f"[[field.case]]   # 形 {_c(sh)}・{sum(by[sh].values())}件 例 {_c(exs[0])}\n"
+                     f"pattern = {_q(pattern)}\nparts = {{ {parts} }}\n")
+    if texts and len(set(texts)) <= _DRAFT_TEXT_CASE_MAX:
+        alt = "|".join(re.escape(t) for t in dict.fromkeys(texts))
+        cases.append(f"[[field.case]]   # 数字のない値\nmatch = {_q('^(?P<text>' + alt + ')$')}\n"
+                     f"parts = {{ text = {_q(_out_name(col, 'text', taken))} }}\n")
+        texts = []
+    if cases:
+        why = (["形ごとの case。単位で区別できない数値の出力列名は、左からの順に付けた仮の名前（n1, n2…）なので、"
+                "意味に合わせて付け直す"] if positional else [])
+        if left or texts:
+            why.append(f"case にできなかった形 {', '.join(left + texts[:3])}")
+        cands.append((f"[[field]]\nsrc = {_q(col)}\n" + "".join(cases), "複合表記（形ごとの case）", why))
+    return cands
+
+
 def draft_toml(cfg: Config, header: list[str], rows: list[list[str]]) -> str:
-    """CSVの実態からルールの下書きを作る。必ず人/agentが見直し、check で検証すること。"""
+    """CSVの実態からルールの下書きを作る。必ず人/agentが見直し、check で検証すること。
+
+    列ごとに 数量 → 複合表記 → 表記ゆれ の順に調べ、作った下書きは今のデータで実際に変換して結果を
+    コメントに書く。ルールを作らなかった列も、理由を冒頭の一覧に書く（空と抽出NG印だけの列を除く）。"""
     uh, _ = uniquify(header)
+    nkey = _key_columns(uh)
     syn_blocks: list[str] = []
     field_blocks: list[str] = []
     notes: list[str] = []
+    index: list[str] = []
+    taken = set(uh)
     for i, col in enumerate(uh):
-        if i == 0:
+        if i < nkey:
             continue
         vals = Counter(normalize_text(r[i]) for r in rows if i < len(r))
         vals = Counter({v: n for v, n in vals.items() if v and not _is_reserved(cfg, v)})
         if not vals:
-            continue
+            continue                                  # 空と抽出NG印だけの列（missing）は下書きの対象外
         total = sum(vals.values())
-        units: Counter = Counter()
-        parsed = 0
-        for v, n in vals.items():
-            try:
-                _, u = parse_quantity(v, cfg.units)
-                parsed += n
-                if u:
-                    units[u] += n
-            except UnitError:
-                pass
-        known = {u: n for u, n in units.items() if cfg.units.known(u)}
-        if parsed / total >= 0.8 and known:
-            to = max(known, key=known.get)
-            field_blocks.append(
-                f"[[field]]\nsrc = {_q(col)}\nto = {_q(to)}\ndefault_unit = {_q(to)}   # 単位なしの値は{_c(to)}とみなす\n"
-                f"# 検出された単位: {_c(', '.join(f'{u}×{n}' for u, n in units.most_common()))}\n")
+        pairs = [[r[0] if r else "", r[i] if i < len(r) else ""] for r in rows]
+        tryit = lambda text: _draft_try(cfg, uh[0], col, pairs, text)
+
+        def emit(blocks_syn: str, block: str, why: list[str], label: str) -> None:
+            res = tryit(blocks_syn + block)
+            bad = res is None or res["errors"] or res["warnings"]
+            flag = "要確認" if (why or bad) else "ルール"
+            index.append(_c(f"#   {col}: {flag} — {label}" + (f"（{'; '.join(why)}）" if why else "")))
+            if blocks_syn:
+                syn_blocks.append(blocks_syn)
+            field_blocks.append(block + "".join(_c(f"# 要確認: {w}") + "\n" for w in why) + _tried(res))
+
+        multi = sum(n for v, n in vals.items() if _numbers_in(v) >= 2
+                    or (any(ch in v for ch in "±×～~") and any(c.isdigit() for c in v)))
+        if multi / total < 0.2:
+            q = _draft_quantity(cfg, col, vals, total)
+            if q:
+                emit("", q[0], q[1], q[2])
+                continue
+        if multi:
+            best = None
+            for body, label, why in _composite_candidates(cfg, col, vals, taken):
+                res = tryit(body)
+                if res is None:
+                    continue
+                score = res["errors"] * 2 + res["warnings"]
+                if best is None or score < best[0]:
+                    best = (score, body, label, why)
+                if score == 0:
+                    break
+            if best is not None and best[0] < 2 * total:
+                for m in re.finditer(r'= ("(?:[^"\\]|\\.)*")', best[1].split("parts", 1)[-1]):
+                    taken.add(json.loads(m.group(1)))
+                emit("", best[1], best[3], best[2])
+                continue
+        s = _draft_synonyms(col, vals)
+        if s:
+            notes += s[3]
+            emit(s[0], s[1], s[2], s[4])
             continue
-        allc = synonym_candidates(vals)
-        cands = [c for c in allc if c["kind"] == "exact"]   # 下書きに載せるのは機械的に同一視できるものだけ
-        for c in allc:
-            if c["kind"] != "exact":
-                notes.append(_c(f"# {col}: 表記ゆれの疑い（要確認）{c['canonical']!r} ← {c['variants']}"))
-        if cands:
-            name = col
-            body = "".join(f"{_q(c['canonical'])} = [{', '.join(_q(v) for v in c['variants'])}]"
-                           f"   # {_c(c['kind'])}・{c['count']}件\n" for c in cands)
-            syn_blocks.append(f"[synonyms.{_q(name)}]\n{body}")
-            field_blocks.append(f"[[field]]\nsrc = {_q(col)}\nsynonyms = {_q(name)}\non_unknown = \"warn\"\n")
-            continue
-        comp = [v for v in vals if any(ch in v for ch in "±×～~") and any(c.isdigit() for c in v)]
-        if comp:
-            notes.append(_c(f"# {col}: 複合表記（例 {comp[0]!r}）。match と parts で分解する"))
+        nums = sum(n for v, n in vals.items() if _numbers_in(v) == 1 and re.fullmatch(r"[-+]?[\d.,]+", v))
+        if multi:
+            why = "複合表記だが、どの書き方の下書きも合わなかった。match と parts で分解する"
+        elif nums == total:
+            why = "数値だけ（単位なし）。そのままで使える"
+        elif len(vals) == total and total > 3:
+            why = f"自由記述または番号（値がすべて別、{total} 種類）"
+        elif len(vals) <= _DRAFT_VOCAB_MAX:
+            why = f"表記ゆれなし（値 {len(vals)} 種類: {', '.join(list(vals)[:5])}{' …' if len(vals) > 5 else ''}）"
+        else:
+            why = f"表記ゆれが見つからない（値 {len(vals)} 種類）"
+        index.append(_c(f"#   {col}: ルールなし — {why}"))
+    counts = Counter(line.split(": ", 1)[1].split(" — ")[0] for line in index)
     head = ("# tenugui draft — 自動生成の下書き。そのまま使わず、内容を確認して check で検証すること\n"
-            "schema_version = 1\n\n")
+            f"# 列ごとの結果（{len(index)} 列: ルール {counts['ルール']} / 要確認 {counts['要確認']} / "
+            f"ルールなし {counts['ルールなし']}。空と抽出NG印だけの列は除く）\n"
+            + "".join(l + "\n" for l in index) + "schema_version = 1\n\n")
     return head + "".join(b + "\n" for b in syn_blocks) + "".join(b + "\n" for b in field_blocks) \
         + ("\n".join(notes) + "\n" if notes else "")
 

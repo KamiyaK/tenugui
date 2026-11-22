@@ -11,7 +11,7 @@ tenugui --version
 ```
 tenugui survey  in.csv -c rules.toml -k 列名      # ルールを書く前に値の実態を数える
 tenugui check   -c rules.toml [in.csv]            # 設定の検証（CSVを渡すと列の存在・ヘッダ変化も確認）
-tenugui draft   in.csv -o draft.toml              # 実態からルールの下書きを作る
+tenugui draft   in.csv -o draft.toml              # 実態からルールの下書きを作る（冒頭に全列の結果。要確認の行は必ず見直す）
 tenugui try     -c rules.toml --field 列 値        # CSVなしで1つの値を試す
 tenugui ui                                        # 簡易UI
 tenugui convert in.csv -c rules.toml              # in.csv のあるフォルダの tenugui_out/ に 結果CSV・HTMLレポート・JSONレポート

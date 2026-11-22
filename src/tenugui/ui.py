@@ -503,7 +503,9 @@ def main() -> int:
                                          initialdir=str(dd), initialfile="draft.toml")
         if p:
             Path(p).write_text(text, encoding="utf-8")
-            say([f"下書きを書きました → {p}", "内容を確認・編集してから、ルールTOMLに指定して「検証」してください。"])
+            summary = [ln.lstrip("# ") for ln in text.splitlines()[1:2]]      # 列ごとの結果の件数
+            say([f"下書きを書きました → {p}", *summary,
+                 "「要確認」の列を見直してから、ルールTOMLに指定して「検証」してください。"])
             v_toml.set(p)
 
     ttk.Button(bar, text="形を集計", command=guarded(do_shapes)).pack(side="left", padx=2)
