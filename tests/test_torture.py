@@ -408,7 +408,7 @@ class _Tags(HTMLParser):
     def handle_starttag(self, tag, attrs):
         self.tags.add(tag)
         self.attrs |= {a for a, _ in attrs}
-        if tag not in ("meta", "br", "input"):
+        if tag not in ("meta", "br", "input", "col"):
             self.stack.append(tag)
 
     def handle_endtag(self, tag):
@@ -457,7 +457,8 @@ reason = "<img src=x onerror=1>"
     t = _Tags()
     t.feed(html)
     assert t.tags <= {"html", "head", "meta", "title", "style", "body", "h1", "h2", "div", "p", "span", "b", "code", "br",
-                      "table", "thead", "tbody", "tr", "th", "td", "label", "input", "script", "ul", "li", "details", "summary"}
+                      "table", "thead", "tbody", "tr", "th", "td", "label", "input", "script", "ul", "li", "details", "summary",
+                      "colgroup", "col"}
     assert not {a for a in t.attrs if a.startswith("on")} and not t.stack and not t.bad
     assert html.count("<script") == 1 and "<img" not in html and "<svg" not in html and html.count("<h1") == 1
     rep = json.loads(Path(j["files"]["json"]).read_text(encoding="utf-8"))

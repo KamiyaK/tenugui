@@ -24,6 +24,7 @@ import pytest
 
 from tenugui.cli import main
 from tenugui.core import read_csv
+from tenugui.report import embedded_table
 
 HERE = Path(__file__).parent
 FROZEN = HERE / "chozu_output.csv"
@@ -107,8 +108,9 @@ def test_reports_are_wellformed_and_keep_evidence(tmp_path, capsys):
     assert any(i["raw"] == "1250" and i["column"] == "rating" for i in rep["issues"])
     html = Path(j["files"]["html"]).read_text(encoding="utf-8")
     assert html.count("<script") == 1                       # 自前の1つだけ。値に入っていたタグは実行されない形になっている
-    for name in ("#004", "S,005", "S&quot;006", "試験🙂009"):
-        assert name in html
+    keys = {r[2] for r in embedded_table(html)["rows"]}
+    for name in ("#004", "S,005", 'S"006', "試験🙂009"):
+        assert name in keys
 
 
 def test_fail_on_error_stops_the_pipeline(tmp_path, capsys):

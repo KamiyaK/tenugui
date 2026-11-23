@@ -4,12 +4,15 @@ from __future__ import annotations
 import datetime
 import html
 import json
+import re
+import unicodedata
 from pathlib import Path
 
 from .core import Config, Issue, _is_reserved, uniquify
 from .corrections import KIND_LABEL, Provenance
 
 MAX_HTML_ROWS = 2000      # これを超える入力は、問題のある行だけを表に載せる
+DISPLAY_CHARS = 80        # 表のセルに出す文字数。長い値は省略し、全文はカーソルを合わせると出る
 
 _CSS = """
 :root{--bg:#fff;--fg:#1c1c1c;--mut:#666;--line:#d8d8d8;--head:#f3f3f1;
@@ -53,7 +56,116 @@ body.only tr.clean{display:none}
 ul{margin:6px 0;padding-left:20px}
 """
 
-_JS = "document.getElementById('only').addEventListener('change',function(e){document.body.classList.toggle('only',e.target.checked)});"
+_CSS += """
+.vt{height:75vh}
+.vt table{table-layout:fixed;min-width:0;border-collapse:separate;border-spacing:0}
+.vt th,.vt td{height:26px;line-height:17px;max-width:none;overflow:hidden;text-overflow:clip}
+.vt thead th{height:26px;z-index:2}.vt thead th[rowspan]{height:52px}.vt tr.h2 th{top:26px}
+.vt .sl{position:sticky;left:0;z-index:1;background:var(--bg)}.vt .sl1{left:var(--l1)}
+.vt thead .sl{z-index:3;background:var(--head)}
+.vt td.sl1{border-right:2px solid var(--line)}.vt td.sl1.cor{background:var(--cor)}
+.vt tr.sp td{padding:0;border:0;height:auto}.vt td.gap{padding:0;border:0;background:none}
+.tools{margin:4px 0}#q{font:inherit;padding:2px 6px;width:16em}
+"""
+
+# 変換前後の表: 埋め込んだデータ D から、見えている行（と前後の少し）だけを描く。
+# 行の高さを固定にして、描かない行の分は上下の空き行で高さを埋める。列の幅は Python 側で全行から決めてある
+_JS = r"""(function(){
+var only=document.getElementById('only'),W=document.getElementById('vt');
+if(!W||!D){if(only)only.addEventListener('change',function(e){document.body.classList.toggle('only',e.target.checked)});return}
+var H=26,BLK=20,LIM=80,tb=W.querySelector('tbody'),q=document.getElementById('q'),cnt=document.getElementById('cnt');
+W.querySelector('table').style.setProperty('--l1',D.widths[0]+'px');
+var E={'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'};
+function esc(s){return String(s).replace(/[&<>"']/g,function(c){return E[c]})}
+function td(c,j){var t,cl='',ti='',tg='';
+ if(typeof c!=='object'){t=String(c)}else{t=c[0];cl=c[1]||'';
+  if(c.length>3){ti=D.titles[c[2]];tg=D.tags[c[3]].map(function(x){return "<span class='tag'>"+esc(x)+'</span>'}).join('')}}
+ if(j===0)cl='num sl';else if(j===1)cl+=(cl?' ':'')+'sl sl1';
+ var cut=t.length>LIM;if(cut&&!ti)ti=t;
+ return '<td'+(cl?" class='"+cl+"'":'')+(ti?" title='"+esc(ti)+"'":'')+'>'+esc(cut?t.slice(0,LIM)+'…':t)+tg+'</td>'}
+// 列も、見えている範囲（と前後の少し）だけを描く。描かない列は colspan の空きセル1つで幅を埋める
+var NC=D.widths.length,X=[0],c0=NC,c1=2,CB=40;
+for(var j=0;j<NC;j++)X.push(X[j]+D.widths[j]);
+function cols(){var left=W.scrollLeft+X[2],right=W.scrollLeft+W.clientWidth,p=2,q=NC;
+ while(p<NC&&X[p+1]<=left)p++;q=p;while(q<NC&&X[q]<right)q++;return [p,q]}
+function gap(n){return n>0?"<td class='gap' colspan='"+n+"'></td>":''}
+function tr(i){var r=D.rows[i],h="<tr class='"+(r[1]?'dirty':'clean')+"'>"+td(r[0],0)+td(r[2],1)+gap(c0-2);
+ for(var j=c0;j<c1;j++)h+=td(r[j+1],j);return h+gap(NC-c1)+'</tr>'}
+function sp(){var e=document.createElement('tr');e.className='sp';e.innerHTML="<td colspan='"+D.widths.length+"'></td>";return e}
+var top=sp(),bot=sp(),idx=[],a=0,b=0,txt=[];
+function html(x,y){var h='';for(var k=x;k<y;k++)h+=tr(idx[k]);return h}
+function fill(){top.firstChild.style.height=(a*H)+'px';bot.firstChild.style.height=((idx.length-b)*H)+'px'}
+function draw(full){
+ var v=cols();
+ if(v[0]<c0||v[1]>c1){c0=Math.max(2,v[0]-CB);c1=Math.min(NC,v[1]+CB);full=true}
+ // 行を BLK 行ずつのまとまりで描く。見えている範囲の前後1まとまりまで描いておき、外れたときだけ入れ替える
+ // （DOM を変えると表全体を描き直すので、変える回数を減らす）
+ var f=Math.floor(Math.max(0,W.scrollTop-2*H)/H),l=f+Math.ceil(W.clientHeight/H);
+ if(!full&&b>a&&(f>=a||a===0)&&(l<=b||b===idx.length)&&(f-a>=0)&&(b-l>=0))return;
+ var na=Math.max(0,(Math.floor(f/BLK)-1)*BLK),nb=Math.min(idx.length,(Math.floor(l/BLK)+2)*BLK);
+ if(full||nb<=a||na>=b){tb.textContent='';tb.appendChild(top);tb.insertAdjacentHTML('beforeend',html(na,nb));tb.appendChild(bot)}
+ else{var k;
+  if(na>a){for(k=a;k<na;k++)tb.removeChild(top.nextSibling)}else if(na<a){top.insertAdjacentHTML('afterend',html(na,a))}
+  if(nb<b){for(k=nb;k<b;k++)tb.removeChild(bot.previousSibling)}else if(nb>b){bot.insertAdjacentHTML('beforebegin',html(b,nb))}}
+ a=na;b=nb;fill()}
+function norm(s){return String(s).normalize('NFKC').toLowerCase()}
+function text(i){if(txt[i]===undefined){var r=D.rows[i],p=[r[0],r[2]];
+ for(var j=3;j<r.length;j++){var c=r[j];p.push(typeof c!=='object'?c:c[0]+(c.length>3?' '+D.tags[c[3]].join(' '):''))}
+ txt[i]=norm(p.join('\t'))}return txt[i]}
+function filter(){var o=only&&only.checked,s=q?norm(q.value.trim()):'';idx=[];
+ for(var i=0;i<D.rows.length;i++)if((!o||D.rows[i][1])&&(!s||text(i).indexOf(s)>=0))idx.push(i);
+ cnt.textContent=(o||s)?' '+idx.length+' / '+D.rows.length+' 行':'';W.scrollTop=0;draw(true)}
+var busy=false;
+W.addEventListener('scroll',function(){if(!busy){busy=true;requestAnimationFrame(function(){busy=false;draw(false)})}},{passive:true});
+window.addEventListener('resize',function(){draw(false)});
+if(only)only.addEventListener('change',filter);
+var timer;if(q)q.addEventListener('input',function(){clearTimeout(timer);timer=setTimeout(filter,150)});
+filter()})();"""
+
+
+def _row_list(rows: list[int], limit: int = 30) -> str:
+    """問題の内訳の「行」欄。行が多いと HTML が大きくなるので先頭だけ書く（全部は JSON レポートにある）。"""
+    head = ", ".join(map(str, rows[:limit]))
+    return head + (f" ほか {len(rows) - limit} 行" if len(rows) > limit else "")
+
+
+def embedded_table(page: str) -> dict | None:
+    """HTML レポートに埋め込んだ「変換前後」の表のデータを取り出す（テスト・agent 向け）。
+
+    rows の各行 = [行番号, 問題あり(0/1), キー, セル...]。セル = 文字列 | [文字列, 色] | [文字列, 色, titles の番号, tags の番号]。
+    """
+    m = re.search(r"<script>const D=(.*?);\(function\(\)", page, re.S)
+    return json.loads(m.group(1)) if m else None
+
+
+def _json_for_script(obj) -> str:
+    """<script> の中に埋め込む JSON。値に </script> などがあってもタグにならないよう < > & を逃がす。"""
+    return (json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+            .replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
+            .replace("\u2028", "\\u2028").replace("\u2029", "\\u2029"))
+
+
+def _text_width(s: str) -> float:
+    w = 0.0
+    for ch in s[:DISPLAY_CHARS]:
+        w += 13 if unicodedata.east_asian_width(ch) in "WF" else 7.4
+    return w
+
+
+def _widths(labels: list[str], data_rows: list[list], tagsets: list[tuple]) -> list[int]:
+    """列の幅(px)。行を差し替えても幅が変わらないよう、載せる全行から先に決める。"""
+    tag_w = [sum(len(t) * 6.5 + 14 for t in ts) for ts in tagsets]
+    best = [_text_width(x) * 0.95 + 4 for x in labels]       # 見出しは太字
+    for r in data_rows:
+        best[0] = max(best[0], _text_width(str(r[0])))
+        for j, c in enumerate(r[2:], start=1):
+            if isinstance(c, str):
+                w = _text_width(c)
+            else:
+                w = _text_width(c[0]) + (tag_w[c[3]] if len(c) > 3 else 0)
+            if w > best[j]:
+                best[j] = w
+    return [int(min(max(w + 18, 44), 420)) for w in best]
 
 
 def _e(s) -> str:
@@ -194,7 +306,7 @@ def render_html(rep: dict, cfg: Config, header: list[str], rows: list[list[str]]
             col = g["column"] + (f" → {g['out']}" if g["out"] and g["out"] != g["column"] else "")
             P.append(f"<tr><td class='num'>{g['count']}</td><td class='{cls}'>{_e(g['code'])}</td><td>{_e(col)}</td>"
                      f"<td><code>{_e(g['shape'])}</code></td><td>{_e(' / '.join(g['examples']))}</td>"
-                     f"<td>{_e(', '.join(map(str, g['rows'])))}</td>"
+                     f"<td>{_e(_row_list(g['rows']))}</td>"
                      f"<td style='white-space:normal;min-width:260px'>{_e(g['hint'])}</td></tr>")
         P.append("</tbody></table></div>")
     else:
@@ -239,54 +351,68 @@ def render_html(rep: dict, cfg: Config, header: list[str], rows: list[list[str]]
              + (f"<span class='meta'>行数が多いため、問題のある行だけを載せています（{len(show)} / {len(rows)} 行）</span>"
                 if limited else f"<span class='meta'>{len(rows)} 行。色の付いたセルにカーソルを合わせると理由が出ます</span>")
              + "</p>")
+    table_data = None
     if not groups and not derives:
         P.append("<p class='meta'>ルールのかかった列はありません</p>")
     else:
         key_name = uh[0] if uh else ""
-        P.append("<div class='wrap'><table><thead><tr><th rowspan='2'>行</th>"
-                 f"<th rowspan='2'>{_e(key_name)}</th>")
-        for src, outs in groups:
-            P.append(f"<th class='g' colspan='{1 + len(outs)}'>{_e(src)}</th>")
-        if derives:
-            P.append(f"<th class='g' colspan='{len(derives)}'>計算した列</th>")
-        P.append("</tr><tr>")
-        for src, outs in groups:
-            P.append("<th>元の値</th>" + "".join(
-                f"<th>{'変換後' if o == src else _e(o)}</th>" for o in outs))
-        P.append("".join(f"<th>{_e(o)}</th>" for o in derives) + "</tr></thead><tbody>")
+        # 表は行ごとのデータを埋め込み、見えている行だけをブラウザで描く（行数・列数が多くてもスクロールが重くならない）。
+        # セル = 文字列 | [文字列, 色] | [文字列, 色, 理由の番号, 印の番号]。理由と印は重複が多いので表にまとめる
+        titles: dict[str, int] = {}
+        tagsets: dict[tuple, int] = {}
 
-        def cell(n: int, col, text: str, base: str) -> str:
+        def cell(n: int, col, text: str, base: str):
             m = marks.get((n, col))
             if m:
                 cls = "err" if m[0] == "E" else ("hold" if m[2] == ["C141"] else "warn")
-                tags = "".join(f"<span class='tag'>{_e('保留' if x == 'C141' else x)}</span>" for x in m[2])
-                return f"<td class='{cls}' title='{_e(' / '.join(m[1]))}'>{_e(text)}{tags}</td>"
-            return f"<td{f' class={base!r}' if base else ''}>{_e(text)}</td>"
+                tags = tuple("保留" if x == "C141" else x for x in m[2])
+                return [text, cls, titles.setdefault(" / ".join(m[1]), len(titles)), tagsets.setdefault(tags, len(tagsets))]
+            return [text, base] if base else text
 
+        h1 = [["行", 1, 2], [key_name, 1, 2]]          # [見出し, 列数, 行数]
+        h2: list[str] = []
+        for src, outs in groups:
+            h1.append([src, 1 + len(outs), 1])
+            h2 += ["元の値", *("変換後" if o == src else o for o in outs)]
+        if derives:
+            h1.append(["計算した列", len(derives), 1])
+            h2 += list(derives)
+        data_rows = []
         for n in show:
             r_in, r_out = rows[n - 1], out_rows[n - 1]
-            P.append(f"<tr class='{'dirty' if n in bad_rows else 'clean'}'><td class='num'>{n}</td>"
-                     f"<td>{_e(r_in[0] if r_in else '')}</td>")
+            r = [n, 1 if n in bad_rows else 0, r_in[0] if r_in else ""]
             for src, outs in groups:
                 i = iidx[src]
                 raw = r_in[i] if i < len(r_in) else ""
                 ng = _is_reserved(cfg, raw)
                 cor = prov.corrected.get((n, src))
                 if cor and (n, ("src", src)) not in marks:
-                    P.append(f"<td class='cor' title='{_e(f'訂正 {raw} → {cor[1].to}（理由: {cor[1].reason}）')}'>"
-                             f"{_e(raw)}<span class='tag'>訂正</span></td>")
+                    r.append([raw, "cor", titles.setdefault(f"訂正 {raw} → {cor[1].to}（理由: {cor[1].reason}）", len(titles)),
+                              tagsets.setdefault(("訂正",), len(tagsets))])
                 else:
-                    P.append(cell(n, ("src", src), raw, "ng" if ng else "src"))
+                    r.append(cell(n, ("src", src), raw, "ng" if ng else "src"))
                 for o in outs:
                     val = r_out[oidx[o]] if o in oidx else ""
                     base = "ng" if ng else ("cor" if cor and val != "" else ("chg" if val != "" and val != raw else ""))
-                    P.append(cell(n, o, val, base))
+                    r.append(cell(n, o, val, base))
             for o in derives:
-                P.append(cell(n, o, r_out[oidx[o]] if o in oidx else "", ""))
-            P.append("</tr>")
-        P.append("</tbody></table></div>")
+                r.append(cell(n, o, r_out[oidx[o]] if o in oidx else "", ""))
+            data_rows.append(r)
+        widths = _widths(["行", key_name, *h2], data_rows, list(tagsets))
+        table_data = {"h1": h1, "h2": h2, "widths": widths, "rows": data_rows,
+                      "titles": list(titles), "tags": [list(t) for t in tagsets]}
+        P.append("<p class='tools'><label class='f'>行を探す <input type='search' id='q' "
+                 "placeholder='品番・値・コードなど'></label><span class='meta' id='cnt'></span></p>"
+                 f"<div class='wrap vt' id='vt'><table style='width:{sum(widths)}px'><colgroup>"
+                 + "".join(f"<col style='width:{w}px'>" for w in widths) + "</colgroup><thead><tr>")
+        for k, (label, span, rs) in enumerate(h1):
+            cls = "sl sl0" if k == 0 else ("sl sl1" if k == 1 else "g")
+            P.append(f"<th class='{cls}'" + (f" colspan='{span}'" if span > 1 else "")
+                     + (f" rowspan='{rs}'" if rs > 1 else "") + f">{_e(label)}</th>")
+        P.append("</tr><tr class='h2'>" + "".join(f"<th>{_e(x)}</th>" for x in h2)
+                 + "</tr></thead><tbody></tbody></table></div>")
 
     return ("<!doctype html><html lang='ja'><head><meta charset='utf-8'>"
             "<meta name='viewport' content='width=device-width,initial-scale=1'>"
             f"<title>Tenugui レポート — {_e(Path(rep['input']).name)}</title><style>{_CSS}</style></head><body>"
-            + "".join(P) + f"<script>{_JS}</script></body></html>")
+            + "".join(P) + f"<script>const D={_json_for_script(table_data)};{_JS}</script></body></html>")
