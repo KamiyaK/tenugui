@@ -58,7 +58,8 @@ class Model:
     def default_output(self, csv_path: str) -> str:
         return str(default_out_dir(csv_path) / f"{Path(csv_path).stem}_tenugui.csv")
 
-    def convert(self, csv_path: str, toml_path: str, out_path: str, verify: bool = False) -> list[str]:
+    def convert(self, csv_path: str, toml_path: str, out_path: str, verify: bool = False,
+                plain_html: bool = False) -> list[str]:
         self.load(csv_path, toml_path)
         uh, _ = uniquify(self.header)
         probs = check_header(self.cfg, uh)
@@ -67,7 +68,7 @@ class Model:
         out = resolve_output(csv_path, out_path or None, None, False,   # tenugui_out/ が無ければ作る
                              [("設定ファイル", toml_path)] if toml_path else None)
         r = convert_to_files(self.cfg, toml_path, csv_path, self.header, self.rows, out, verify=verify,
-                             command="tenugui ui")
+                             command="tenugui ui", plain_html=plain_html)
         self.out_header, self.out_rows = r["out_header"], r["out_rows"]
         self.issues, self.changes, self.verification = r["idicts"], r["changes"], r["verification"]
         self.out_path, self.out_dir, self.html_path = str(out), str(out.parent), r["files"]["html"]
@@ -174,6 +175,7 @@ def main() -> int:
 
     v_in, v_toml, v_out = tk.StringVar(), tk.StringVar(), tk.StringVar()
     v_verify = tk.BooleanVar(value=True)
+    v_plain = tk.BooleanVar(value=False)
     v_filter = tk.StringVar(value="すべて")
     v_allcols = tk.BooleanVar(value=False)
 
@@ -472,7 +474,7 @@ def main() -> int:
         if not v_out.get():
             messagebox.showwarning("Tenugui", "出力CSVを指定してください")
             return
-        lines = m.convert(v_in.get(), v_toml.get(), v_out.get(), v_verify.get())
+        lines = m.convert(v_in.get(), v_toml.get(), v_out.get(), v_verify.get(), v_plain.get())
         say(lines)
         fill_issues()
         fill_groups()
@@ -513,6 +515,7 @@ def main() -> int:
     ttk.Button(bar, text="変換", command=guarded(do_convert)).pack(side="left", padx=2)
     ttk.Button(bar, text="下書きを作る", command=guarded(do_draft)).pack(side="left", padx=2)
     ttk.Checkbutton(bar, text="再実行の安定性も確認", variable=v_verify).pack(side="left", padx=10)
+    ttk.Checkbutton(bar, text="HTMLを圧縮しない", variable=v_plain).pack(side="left")
 
     def open_out_dir():
         d = m.out_dir or (str(default_out_dir(v_in.get())) if v_in.get() else "")

@@ -20,12 +20,12 @@ parts = { nom = "t_nom", tol = "t_tol" }
 """
 
 
-def report(tmp_path, rows):
+def report(tmp_path, rows, *extra):
     import csv
     with open(tmp_path / "in.csv", "w", encoding="utf-8-sig", newline="") as f:
         csv.writer(f).writerows([["key", "len", "tol"], *rows])
     (tmp_path / "r.toml").write_text(RULES, encoding="utf-8")
-    main(["convert", str(tmp_path / "in.csv"), "-c", str(tmp_path / "r.toml")])
+    main(["convert", str(tmp_path / "in.csv"), "-c", str(tmp_path / "r.toml"), *extra])
     return (tmp_path / "tenugui_out" / "in_tenugui.html").read_text(encoding="utf-8")
 
 
@@ -42,10 +42,11 @@ def test_data_shape_matches_the_header(tmp_path):
     assert page.count("<col ") == len(t["widths"])
 
 
-def test_hostile_values_never_become_tags(tmp_path):
-    page = report(tmp_path, [["</script><script>alert(1)</script>", "<img src=x onerror=1>", "&amp; "]])
-    data = re.search(r"const D=(.*?);\(function", page, re.S).group(1)
-    assert "<" not in data and ">" not in data and "&" not in data and " " not in data
+@pytest.mark.parametrize("extra", [(), ("--plain-html",)])
+def test_hostile_values_never_become_tags(tmp_path, extra):
+    page = report(tmp_path, [["</script><script>alert(1)</script>", "<img src=x onerror=1>", "&amp;\u2028"]], *extra)
+    data = re.search(r"<script>const [DZ]=(.*?);\(function", page, re.S).group(1)
+    assert "<" not in data and ">" not in data and "&" not in data and "\u2028" not in data
     assert page.count("<script") == 1 and "<img" not in page
     assert embedded_table(page)["rows"][0][2] == "</script><script>alert(1)</script>"
 
@@ -68,3 +69,30 @@ def test_script_is_valid_javascript(tmp_path):
     js = tmp_path / "r.js"
     js.write_text(re.search(r"<script>(.*?)</script>", page, re.S).group(1), encoding="utf-8")
     subprocess.run(["node", "--check", str(js)], check=True)
+
+
+def test_table_data_is_compressed_by_default_and_plain_on_request(tmp_path):
+    rows = [[f"P{n}", f"{n}mm", f"{n}±0.1"] for n in range(300)]
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    packed = report(tmp_path / "a", rows)
+    plain = report(tmp_path / "b", rows, "--plain-html")
+    assert '<script>const Z="' in packed and "<script>const D={" in plain
+    assert embedded_table(packed) == embedded_table(plain)
+    assert len(packed) < len(plain) / 2
+    assert "DecompressionStream" in packed
+
+
+def test_output_has_no_comments(tmp_path):
+    page = report(tmp_path, [["A", "40mm", "10±0.2"]])
+    script = re.search(r"<script>(.*?)</script>", page, re.S).group(1)
+    assert "<!--" not in page and "/*" not in page
+    assert not re.search(r"(^|[;{}\s])//", script)
+
+
+def test_ui_model_can_write_plain_html(tmp_path):
+    from tenugui.ui import Model
+    report(tmp_path, [["A", "40mm", "10±0.2"]])
+    m = Model()
+    m.convert(str(tmp_path / "in.csv"), str(tmp_path / "r.toml"), "", plain_html=True)
+    assert "<script>const D={" in (tmp_path / "tenugui_out" / "in_tenugui.html").read_text(encoding="utf-8")
