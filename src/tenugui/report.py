@@ -1,7 +1,9 @@
 """変換レポート: 人が見る HTML（1ページ・単体で開ける）と、機械が読む JSON。"""
 from __future__ import annotations
 
+import base64
 import datetime
+import gzip
 import html
 import json
 import re
@@ -70,7 +72,11 @@ _CSS += """
 
 # 変換前後の表: 埋め込んだデータ D から、見えている行（と前後の少し）だけを描く。
 # 行の高さを固定にして、描かない行の分は上下の空き行で高さを埋める。列の幅は Python 側で全行から決めてある
-_JS = r"""(function(){
+# 列も、見えている範囲（と前後の少し）だけを描く。描かない列は colspan の空きセル1つで幅を埋める。
+# 行は BLK 行ずつのまとまりで描き、見えている範囲の前後1まとまりまで描いておき、外れたときだけ入れ替える
+# （DOM を変えると表全体を描き直すので、変える回数を減らす）。出力にはコメントを入れない。
+# 圧縮したとき（Z）は、ブラウザの DecompressionStream で戻してから描く。
+_JS = r"""(function(){function T(D){
 var only=document.getElementById('only'),W=document.getElementById('vt');
 if(!W||!D){if(only)only.addEventListener('change',function(e){document.body.classList.toggle('only',e.target.checked)});return}
 var H=26,BLK=20,LIM=80,tb=W.querySelector('tbody'),q=document.getElementById('q'),cnt=document.getElementById('cnt');
@@ -83,7 +89,6 @@ function td(c,j){var t,cl='',ti='',tg='';
  if(j===0)cl='num sl';else if(j===1)cl+=(cl?' ':'')+'sl sl1';
  var cut=t.length>LIM;if(cut&&!ti)ti=t;
  return '<td'+(cl?" class='"+cl+"'":'')+(ti?" title='"+esc(ti)+"'":'')+'>'+esc(cut?t.slice(0,LIM)+'…':t)+tg+'</td>'}
-// 列も、見えている範囲（と前後の少し）だけを描く。描かない列は colspan の空きセル1つで幅を埋める
 var NC=D.widths.length,X=[0],c0=NC,c1=2,CB=40;
 for(var j=0;j<NC;j++)X.push(X[j]+D.widths[j]);
 function cols(){var left=W.scrollLeft+X[2],right=W.scrollLeft+W.clientWidth,p=2,q=NC;
@@ -98,8 +103,6 @@ function fill(){top.firstChild.style.height=(a*H)+'px';bot.firstChild.style.heig
 function draw(full){
  var v=cols();
  if(v[0]<c0||v[1]>c1){c0=Math.max(2,v[0]-CB);c1=Math.min(NC,v[1]+CB);full=true}
- // 行を BLK 行ずつのまとまりで描く。見えている範囲の前後1まとまりまで描いておき、外れたときだけ入れ替える
- // （DOM を変えると表全体を描き直すので、変える回数を減らす）
  var f=Math.floor(Math.max(0,W.scrollTop-2*H)/H),l=f+Math.ceil(W.clientHeight/H);
  if(!full&&b>a&&(f>=a||a===0)&&(l<=b||b===idx.length)&&(f-a>=0)&&(b-l>=0))return;
  var na=Math.max(0,(Math.floor(f/BLK)-1)*BLK),nb=Math.min(idx.length,(Math.floor(l/BLK)+2)*BLK);
@@ -120,7 +123,12 @@ W.addEventListener('scroll',function(){if(!busy){busy=true;requestAnimationFrame
 window.addEventListener('resize',function(){draw(false)});
 if(only)only.addEventListener('change',filter);
 var timer;if(q)q.addEventListener('input',function(){clearTimeout(timer);timer=setTimeout(filter,150)});
-filter()})();"""
+filter()}
+if(typeof Z==='undefined'){T(typeof D==='undefined'?null:D);return}
+function fail(){var c=document.getElementById('cnt');if(c)c.textContent=' このブラウザでは表を表示できません。新しい Edge / Chrome で開いてください';T(null)}
+if(typeof DecompressionStream==='undefined'){fail();return}
+try{var b=atob(Z),u=new Uint8Array(b.length);for(var i=0;i<b.length;i++)u[i]=b.charCodeAt(i);
+new Response(new Blob([u]).stream().pipeThrough(new DecompressionStream('gzip'))).text().then(function(t){T(JSON.parse(t))},fail)}catch(e){fail()}})();"""
 
 
 def _row_list(rows: list[int], limit: int = 30) -> str:
@@ -135,7 +143,20 @@ def embedded_table(page: str) -> dict | None:
     rows の各行 = [行番号, 問題あり(0/1), キー, セル...]。セル = 文字列 | [文字列, 色] | [文字列, 色, titles の番号, tags の番号]。
     """
     m = re.search(r"<script>const D=(.*?);\(function\(\)", page, re.S)
-    return json.loads(m.group(1)) if m else None
+    if m:
+        return json.loads(m.group(1))
+    m = re.search(r'<script>const Z="([A-Za-z0-9+/=]*)";', page)
+    return json.loads(gzip.decompress(base64.b64decode(m.group(1))).decode("utf-8")) if m else None
+
+
+def _embed(table_data, compress: bool) -> str:
+    """表のデータを <script> の先頭に置く。compress=True なら gzip + base64（メールに添付できる大きさにする）。"""
+    if table_data is None:
+        return "const D=null;"
+    if not compress:
+        return f"const D={_json_for_script(table_data)};"
+    raw = json.dumps(table_data, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return f'const Z="{base64.b64encode(gzip.compress(raw, 9, mtime=0)).decode("ascii")}";'
 
 
 def _json_for_script(obj) -> str:
@@ -250,7 +271,7 @@ def _provenance_html(pv: dict) -> list[str]:
 
 def render_html(rep: dict, cfg: Config, header: list[str], rows: list[list[str]],
                 out_header: list[str], out_rows: list[list[str]], issues: list[Issue],
-                prov: Provenance | None = None) -> str:
+                prov: Provenance | None = None, compress: bool = True) -> str:
     """人が見るレポート。ルールのかかった列について 元の値 → 変換後 を並べ、問題のあるセルに色を付ける。"""
     uh, _ = uniquify(header)
     iidx = {h: i for i, h in enumerate(uh)}
@@ -415,4 +436,4 @@ def render_html(rep: dict, cfg: Config, header: list[str], rows: list[list[str]]
     return ("<!doctype html><html lang='ja'><head><meta charset='utf-8'>"
             "<meta name='viewport' content='width=device-width,initial-scale=1'>"
             f"<title>Tenugui レポート — {_e(Path(rep['input']).name)}</title><style>{_CSS}</style></head><body>"
-            + "".join(P) + f"<script>const D={_json_for_script(table_data)};{_JS}</script></body></html>")
+            + "".join(P) + f"<script>{_embed(table_data, compress)}{_JS}</script></body></html>")

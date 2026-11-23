@@ -251,7 +251,8 @@ def _convert_one(args, cfg, input_path: str, batch: bool = False,
             renamed = f"注意: 同じ名前の出力（{first.name}）が先にあるため、{out.name} に書きました"
     r = convert_to_files(cfg, args.config, input_path, header, rows, out, no_diff=args.no_diff,
                          verify=args.verify, command="tenugui " + " ".join(sys.argv[1:]),
-                         detail_files=args.detail_files, report_unused=not batch)
+                         detail_files=args.detail_files, report_unused=not batch,
+                         plain_html=args.plain_html)
     out_rows, changes, ver, idem = r["out_rows"], r["changes"], r["verification"], r["not_idempotent"]
     drift, files = r["drift"], r["files"]
     e, w = r["errors"], r["warnings"]
@@ -675,6 +676,8 @@ def main(argv: list[str] | None = None) -> int:
     c.add_argument("--timestamp", action="store_true", help="出力ファイル名に日時を付ける")
     c.add_argument("--detail-files", action="store_true",
                    help="従来の *_conv.csv（問題一覧）・*_diff.csv（変更セル）・*.log も書く（同じ内容は JSON レポートにある）")
+    c.add_argument("--plain-html", action="store_true",
+                   help="HTML レポートの表のデータを圧縮しない（既定は圧縮して小さくする。開くには新しい Edge / Chrome などが要る）")
     c.add_argument("--no-diff", action="store_true", help="--detail-files のとき *_diff.csv を出さない")
     c.add_argument("--diff", action="store_true", help=argparse.SUPPRESS)   # 互換（既定で出力する）
     c.add_argument("--verify", action="store_true", help="変換結果を再度通して値が変わる列を検出（冪等性）")

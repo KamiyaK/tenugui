@@ -1007,7 +1007,7 @@ def output_files(out: Path) -> list[Path]:
 def convert_to_files(cfg: Config, config_path: str, input_path: str, header: list[str],
                      rows: list[list[str]], out: Path, *, no_diff: bool = False,
                      verify: bool = False, command: str = "", detail_files: bool = False,
-                     report_unused: bool = True) -> dict:
+                     report_unused: bool = True, plain_html: bool = False) -> dict:
     """変換して、出力CSV・HTMLレポート（人が見る）・JSONレポート（機械が読む）を out と同じフォルダに書く。
     訂正ファイルを使っているときだけ、修正依頼リスト <名>_fix.csv も書く。
     detail_files=True で、従来の 変換レポートCSV・差分CSV・ログ も書く。印字はしない。
@@ -1023,7 +1023,8 @@ def convert_to_files(cfg: Config, config_path: str, input_path: str, header: lis
     st = _Staged()
     try:
         res = _write_outputs(st, cfg, config_path, input_path, header, rows, out, out_header, out_rows, issues,
-                             prov, uh, dups, drift, no_diff, verify, command, detail_files, report_unused)
+                             prov, uh, dups, drift, no_diff, verify, command, detail_files, report_unused,
+                             plain_html)
         st.commit()
         return res
     except UnicodeEncodeError as e:
@@ -1039,7 +1040,8 @@ def convert_to_files(cfg: Config, config_path: str, input_path: str, header: lis
 def _write_outputs(st: _Staged, cfg: Config, config_path: str, input_path: str, header: list[str],
                    rows: list[list[str]], out: Path, out_header: list[str], out_rows: list[list[str]],
                    issues: list[Issue], prov: Provenance, uh: list[str], dups: list[str], drift: dict | None,
-                   no_diff: bool, verify: bool, command: str, detail_files: bool, report_unused: bool) -> dict:
+                   no_diff: bool, verify: bool, command: str, detail_files: bool, report_unused: bool,
+                   plain_html: bool = False) -> dict:
     from . import __version__
     from .core import outputs_from, write_csv, write_report
     from .report import build_report, render_html, write_json
@@ -1083,7 +1085,8 @@ def _write_outputs(st: _Staged, cfg: Config, config_path: str, input_path: str, 
     # 出力CSVの指紋。後段（design_erc）は、CSV がこのレポートの後に書き換えられていないかをこれで確かめる
     report["output_sha256"] = hashlib.sha256(st.path_of(out).read_bytes()).hexdigest()
     write_json(st.path(jsonp), report)
-    st.path(htmlp).write_text(render_html(report, cfg, header, rows, out_header, out_rows, issues, prov), encoding="utf-8")
+    st.path(htmlp).write_text(render_html(report, cfg, header, rows, out_header, out_rows, issues, prov,
+                                              compress=not plain_html), encoding="utf-8")
     return {"out_header": out_header, "out_rows": out_rows, "issues": issues, "idicts": idicts,
             "changes": changes, "verification": ver, "not_idempotent": idem, "drift": drift,
             "files": files, "errors": e, "warnings": len(issues) - e, "duplicates": dups,

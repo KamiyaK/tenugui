@@ -90,7 +90,7 @@ def test_html_report_marks_cells_and_escapes(work, capsys):
     assert "in_tenugui.html" in text
     h = (work / "tenugui_out" / "in_tenugui.html").read_text(encoding="utf-8")
     assert h.startswith("<!doctype html>") and "<script src" not in h and "http" not in h      # 単体で開ける
-    assert "<b>約</b>330" not in h and "\\u003cb\\u003e約" in h                    # 値はタグにならない形で埋め込む
+    assert "<b>約</b>330" not in h                                # 値はタグにならない形で埋め込む
     t = embedded_table(h)
     cells = [c for r in t["rows"] for c in r[3:]]
     assert any(isinstance(c, list) and c[0] == "<b>約</b>330" for c in cells)   # 元の値（表示は JS がエスケープする）
