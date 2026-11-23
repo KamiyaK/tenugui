@@ -6,6 +6,7 @@ import pytest
 from tenugui import __version__
 from tenugui.cli import main
 from tenugui.core import ConfigError, config_from_dict, convert_rows
+from tenugui.report import embedded_table
 
 
 def cfg(**kw):
@@ -89,10 +90,15 @@ def test_html_report_marks_cells_and_escapes(work, capsys):
     assert "in_tenugui.html" in text
     h = (work / "tenugui_out" / "in_tenugui.html").read_text(encoding="utf-8")
     assert h.startswith("<!doctype html>") and "<script src" not in h and "http" not in h      # 単体で開ける
-    assert "&lt;b&gt;約&lt;/b&gt;330" in h and "<b>約</b>330" not in h                          # 値はエスケープ
-    assert h.count("class='err' title=") == 3                    # 元の値 + nom + tol の3セル
-    assert "<span class='tag'>C111</span>" in h and "class='ng'>NG<" in h
-    assert "class='chg'>330<" in h and "tr class='dirty'" in h and "tr class='clean'" in h
+    assert "<b>約</b>330" not in h and "\\u003cb\\u003e約" in h                    # 値はタグにならない形で埋め込む
+    t = embedded_table(h)
+    cells = [c for r in t["rows"] for c in r[3:]]
+    assert any(isinstance(c, list) and c[0] == "<b>約</b>330" for c in cells)   # 元の値（表示は JS がエスケープする）
+    errs = [c for c in cells if isinstance(c, list) and c[1] == "err"]
+    assert len(errs) == 3                                        # 元の値 + nom + tol の3セル
+    assert all(t["tags"][c[3]] == ["C111"] and "C111" in t["titles"][c[2]] for c in errs)
+    assert ["NG", "ng"] in cells and ["330", "chg"] in cells
+    assert {r[1] for r in t["rows"]} == {0, 1}                   # 問題のある行とない行
     assert "削除した元の列 <b>len</b>（変換に失敗した行 1 件" in h
 
 
@@ -105,7 +111,8 @@ def test_html_report_limits_rows_to_problem_rows(tmp_path, capsys, monkeypatch):
                                      'strip_units = ["mm"]\n', encoding="utf-8")
     main(["convert", str(tmp_path / "in.csv"), "-c", str(tmp_path / "r.toml")])
     h = (tmp_path / "tenugui_out" / "in_tenugui.html").read_text(encoding="utf-8")
-    assert "問題のある行だけを載せています（1 / 9 行）" in h and h.count("<tr class='dirty'") == 1
+    assert "問題のある行だけを載せています（1 / 9 行）" in h
+    assert [(r[0], r[1]) for r in embedded_table(h)["rows"]] == [(9, 1)]
 
 
 def test_version_flag(capsys):
