@@ -1,4 +1,4 @@
-"""0.16.0: case の warn（書き方は本来と違うが値は取る）と、利用者が決める報告コード [codes]（CU000〜CU999）。"""
+"""0.18.0: case の warn（書き方は本来と違うが値は取る）と、利用者が決める報告コード [codes]（CU000〜CU999）。"""
 import json
 
 import pytest

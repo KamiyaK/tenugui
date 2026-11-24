@@ -1,6 +1,6 @@
 # Tenugui AGENT_REFERENCE（agent向け・機械向けの仕様）
 
-動機や比喩は書かない。人向けは README.md。バージョン 0.17.0 / schema_version = 1。
+動機や比喩は書かない。人向けは README.md。バージョン 0.18.0 / schema_version = 1。
 
 ## 0. 不変条件
 - I1 決定的: 同じ入力・同じ設定なら同じ出力。乱数・時刻・ネットワークを使わない
@@ -72,6 +72,28 @@
 - 符号: `#` は符号つきの数値に一致する。pattern の先頭・`~` の後・`(` の後に書いた `-` は数値の符号（`-#mm` は `-5mm` から -5 を取る）。それ以外の `+` `-`（`#+#-#W`）は区切りで、後ろの数値は符号なしの大きさ
 - 部品は preset と同じ扱い: `to` か `number_only` があれば単位付きで解釈、どちらも無ければ数値の文字列だけ
 - `[[field.case]]`: 1つの `[[field]]`（キーは `src`, `drop_src`, `case` のみ）の下に並べる。各 case は `pattern` | `preset` | `match` のどれか1つ + `parts`。上から順に試し最初の一致を使う。同じ `out` を複数 case で使える。一致した case に無い out は空。全て不一致は C111（1行1件、メッセージに形）。case の parts では `sub` 不可
+- `warn`（0.18.0、case だけ）: その case に一致したら、値は通常どおり取り出したうえで報告を1件（値1つにつき1件）出す。`warn = "メッセージ"` → `C151`(W)、`warn = "CU001"` → `[codes]` に定義したコード・重大度・意味で報告。報告は値を変えない（`on_error` も効かない）。後段は **warn の値を検査対象のまま扱ってよい**（hold と逆）
+  - 付けてよいのは「意味が1通りに決まる書き方違い」だけ（単位の省略、旧書式など）。2通りに読めるなら `[[hold]]`、誤記なら `[[correct]]`。何でも受ける case（`match = '^(?P<t>.+)$'` など）に付けると L601
+  - 本来の形の case を先に書く（上から順に試すため）。`case_coverage[].cases[].warn` にその case のコード、`issue_groups` に件数・例・行が出る（元データの書式の修正依頼にそのまま使う）
+- `[codes]`（0.18.0）: 利用者が決める報告コード。キーは `CU000`〜`CU999`（CU + 数字3桁。組み込みの C / L は変えられない）。`CU001 = { severity = "W", meaning = "単位なし（記載ルール違反）", hint = "元データの修正を依頼" }`。`severity` は W（既定）| E、`meaning` 必須（報告のメッセージ）、`hint` 任意（JSON の hint）。参照するのは case の `warn` だけ。`[[test]] codes` にも書ける
+  ```toml
+  [codes]
+  CU001 = { meaning = "単位なし（記載ルール違反）", hint = "元データの修正を依頼" }
+
+  [[field]]
+  src = "len"
+  [[field.case]]                 # 本来の形
+  pattern = "#±#mm"
+  parts = { n1 = "len_nom", n2 = "len_tol" }
+  [[field.case]]                 # 公差なし: 値は取る + C151
+  pattern = "#mm"
+  parts = { n1 = "len_nom" }
+  warn = "公差なし"
+  [[field.case]]                 # 単位なし: 値は取る + CU001
+  pattern = "#"
+  parts = { n1 = "len_nom" }
+  warn = "CU001"
+  ```
 - 形 = NFKC後に数値を `#` にした文字列（`330±15mm` → `#±#mm`、桁区切りは残る: `1,200V` → `#,#V`）。**survey / issue_groups / suggest が返す `shape` は、そのまま `pattern` に書ける**
 
 ## 2d. 訂正・保留（0.11.0）— ルールTOMLとは別のファイル
@@ -139,6 +161,8 @@ JSON: `convert` の `verification:{ok,summary,violations[]}`、`verify` は `{sc
 | C111 | E | match/extract 不一致 | `try` で正規表現を試す（NFKC後の文字で書く） |
 | C121 | W/E | 同義語表に無い | [synonyms.*] に追加（on_unknown=error のとき E） |
 | C131 | W | 変換はできたが、その列では少数派の形（単位なし・桁区切り `1,200`・書き方違い）。値のある行が20以上の、数値として読む通常の field と preset が対象（pattern / match / case は対象外） | 正しければ放置可。別の書式なら case を足す。無効化は `[settings] rare_shape = 0`（既定 0.05 = 5%以下） |
+| C151 | W | case の `warn = "メッセージ"` に一致した（書き方が本来と違うが、値は取り出した） | 元データの書式を直してもらう。値の検査は止めない。止めたいときは `--fail-on warn` |
+| CU000〜CU999 | W/E | case の `warn = "CU###"` に一致した。意味・重大度は `[codes]` の定義 | `[codes]` の hint に従う。E にすると `--fail-on error` で止まる（値は取り出す） |
 | C141 | W | 保留（訂正ファイルの `[[hold]]`）。変換せず元の値のまま通した | 判断がついたら `[[hold]]` を消し、誤記なら `[[correct]]`、正しい値ならルールを足す。残っていたら止めたいときは `--fail-on hold` |
 | C201 | E | 必須が空 | 入力の欠落、または match の該当部分なし |
 | C301 | E | 派生の入力が数値として読めない | 上流 field で数値化 |
@@ -152,6 +176,7 @@ JSON: `convert` の `verification:{ok,summary,violations[]}`、`verify` は `{sc
 | L201 | W(lint) | 未使用の同義語表 | 削除または field から参照 |
 | L501 | W(lint) | `ignore_columns` に当たる列に field がある（変換はする） | 設計値なら ignore_columns から外す。補助列なら field を消す |
 | L401 | W(lint) | `match` / `extract` の正規表現に繰り返しの入れ子（`(a+)+`、`(\d*)*`）。一致しない値で極端に遅くなる | 内側か外側の繰り返しを外す（`(\d+)+` → `\d+`） |
+| L601 | W(lint) | warn 付きの case がほぼ何でも受ける。C111（エラー）で止まるべき値まで警告に下がる | 数字・単位などの形を書く。2通りに読めるなら `[[hold]]` |
 | C003 | W | lock と列構成が違う（増/減） | 意図した変更なら `tenugui lock` で再記録 |
 | L301 | W | 当たらなかった訂正 | 元データが直ったなら `[[correct]]` を消す。違うなら column / value の綴りを確認 |
 | L302 | W | 当たらなかった保留 | 同上 |
