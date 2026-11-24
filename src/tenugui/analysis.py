@@ -11,7 +11,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from .core import (PRESETS, Config, ConfigError, FieldRule, Issue, _apply_field, _is_reserved, check_header, compile_pattern,
-                   config_from_dict, is_ignored_column, is_null,
+                   config_from_dict, is_case_warn_code, is_ignored_column, is_null,
                    convert_rows, select_case, shape_of, survey as _survey, uniquify)
 from .corrections import KIND_LABEL, Provenance, summarize, unused_entries
 from .units import UnitError, UnitTable, fold_key, normalize_text, parse_quantity
@@ -30,6 +30,7 @@ HINTS = {
     "L501": "設計値の列なら [settings] ignore_columns から外す。補助の列なら field を消す",
     "L401": "正規表現の繰り返しを入れ子にしない。(\\d+)+ は \\d+ と同じ意味で、ずっと速い",
     "C121": "同義語表に無い値。[synonyms.*] に追加するか on_unknown を見直す（survey の candidates 参照）",
+    "C151": "書き方が本来と違うが、case の warn で受けて値は取り出した。元データの書式を直してもらう（値の検査は後段で続けてよい）",
     "C141": "訂正ファイルの [[hold]]（保留）に当たった値。変換せず元の値のまま通している。"
             "判断がついたら [[hold]] を消し、誤記なら [[correct]] に、正しい値ならルールを足す",
     "C201": "必須項目が空。入力データの欠落か、match の該当部分が無い",
@@ -42,13 +43,24 @@ HINTS = {
 }
 
 
-def issue_dict(i: Issue) -> dict:
+def hint_of(code: str, cfg: Config | None = None) -> str:
+    """報告コードの対処のヒント。利用者のコード（CU###）は [codes] の hint を使う。"""
+    if cfg is not None and code in cfg.user_codes:
+        return cfg.user_codes[code]["hint"]
+    return HINTS.get(code, "")
+
+
+def issue_dict(i: Issue, cfg: Config | None = None) -> dict:
     return {"row": i.row, "key": i.key, "column": i.column, "out": i.out, "code": i.code,
-            "severity": i.severity, "message": i.message, "raw": i.raw, "hint": HINTS.get(i.code, "")}
+            "severity": i.severity, "message": i.message, "raw": i.raw, "hint": hint_of(i.code, cfg)}
 
 
 # ---------------------------------------------------------------- lint（設定だけで分かる注意）
 _NESTED_REPEAT = re.compile(r"\((?:[^()\\]|\\.)*[+*](?:[^()\\]|\\.)*\)\s*(?:[+*]|\{\d+,\}?)")
+
+
+def _only_case(fr: FieldRule, k: int) -> FieldRule:
+    return replace(fr, case_rx=[fr.case_rx[k]], case_labels=[fr.case_labels[k]], alts={}, case_warns=[])
 
 
 def lint(cfg: Config) -> list[dict]:
@@ -69,6 +81,19 @@ def lint(cfg: Config) -> list[dict]:
                 out.append({"code": "L401", "where": fr.src,
                             "message": f"{what} の正規表現 {pat!r} に、繰り返しの中の繰り返し（(a+)+ の形）があります。"
                                        "一致しない値で処理が止まったように遅くなることがあります。内側か外側の繰り返しを外してください"})
+    seen_warn: set = set()
+    for fr in cfg.fields:
+        for k, rx in enumerate(fr.case_rx):
+            w = fr.case_warns[k] if k < len(fr.case_warns) else None
+            if not w or (fr.src, k) in seen_warn:
+                continue
+            seen_warn.add((fr.src, k))
+            hit = sum(1 for v in _WARN_PROBES if select_case(_only_case(fr, k), v) == 0)
+            if hit >= len(_WARN_PROBES) - 1:
+                out.append({"code": "L601", "where": f"{fr.src} case #{k + 1}",
+                            "message": f"warn 付きの case #{k + 1}（{fr.case_labels[k]}）がほぼ何でも受けます。"
+                                       "C111（エラー）で止まるべき値まで警告に下がります。warn は意味が1通りに"
+                                       "決まる形だけに付け、数字・単位などの形を書いてください。2通りに読めるなら [[hold]]"})
     for src in dict.fromkeys(fr.src for fr in cfg.fields):
         if is_ignored_column(cfg, src):
             out.append({"code": "L501", "where": src,
@@ -244,21 +269,30 @@ def survey_overview(cfg: Config, header: list[str], rows: list[list[str]], top: 
 
 
 # ---------------------------------------------------------------- 問題のグループ化
-def group_issues(issues: list[Issue], examples: int = 3, rows: int = 5) -> list[dict]:
+def group_issues(issues: list[Issue], examples: int = 3, rows: int = 5, cfg: Config | None = None) -> list[dict]:
     """問題を「列 × コード × 値の形」でまとめる。件数の多い順。行ごとの一覧より桁違いに短い。"""
     by: dict[tuple, dict] = {}
     for i in issues:
         sh = shape_of(i.raw) if i.raw else ""
-        k = (i.column, i.out if i.code != "C111" else "", i.code, sh if len(sh) <= 120 else sh[:120] + "…")
+        k = (i.column, "" if (i.code == "C111" or is_case_warn_code(i.code)) else i.out, i.code, sh if len(sh) <= 120 else sh[:120] + "…")
         g = by.setdefault(k, {"column": i.column, "out": k[1], "code": i.code, "severity": i.severity,
                               "shape": k[3], "count": 0, "examples": [], "rows": [],
-                              "message": i.message, "hint": HINTS.get(i.code, "")})
+                              "message": i.message, "hint": hint_of(i.code, cfg)})
         g["count"] += 1
         if i.raw and i.raw not in g["examples"] and len(g["examples"]) < examples:
             g["examples"].append(i.raw)
         if len(g["rows"]) < rows:
             g["rows"].append(i.row)
     return sorted(by.values(), key=lambda d: (-d["count"], d["column"], d["code"], d["shape"]))
+
+
+def _warn_code(fr: FieldRule, k: int) -> str | None:
+    w = fr.case_warns[k] if k < len(fr.case_warns) else None
+    return w[0] if w else None
+
+
+# warn 付きの case が何でも受けていないかを調べる見本。数字・単位・記号・文字・長い文が混ざる
+_WARN_PROBES = ["1", "abc", "あいう", "10±1mm", "-", "x-y/z", "設計者に確認", "A,B,C", "(注)別紙参照のこと"]
 
 
 def case_coverage(cfg: Config, header: list[str], rows: list[list[str]]) -> list[dict]:
@@ -280,7 +314,8 @@ def case_coverage(cfg: Config, header: list[str], rows: list[list[str]]) -> list
             k = select_case(fr, raw)
             cnt["empty" if k is None else k] += 1
         res.append({"column": fr.src,
-                    "cases": [{"case": k + 1, "label": lb, "count": cnt[k]} for k, lb in enumerate(fr.case_labels)],
+                    "cases": [{"case": k + 1, "label": lb, "count": cnt[k],
+                               "warn": _warn_code(fr, k)} for k, lb in enumerate(fr.case_labels)],
                     "unmatched": cnt[-1], "empty": cnt["empty"], "ng": cnt["ng"]})
     return res
 
@@ -791,7 +826,7 @@ def try_row(cfg: Config, values: dict[str, str]) -> dict:
                 raw = e.to
             _apply_field(cfg, f, raw, {}, (1, ""), [], trace=t)
         traces[f.out] = [{"stage": a, "value": b} for a, b in t]
-    return {"outputs": dict(zip(cols, rows[0])), "issues": [issue_dict(i) for i in issues],
+    return {"outputs": dict(zip(cols, rows[0])), "issues": [issue_dict(i, cfg) for i in issues],
             "trace": traces, "skipped_fields": [f.out for f in cfg.fields if f.src not in values],
             "skipped_derives": skipped_d}
 
@@ -1057,12 +1092,12 @@ def _write_outputs(st: _Staged, cfg: Config, config_path: str, input_path: str, 
         files["fix"] = str(fixp)
     ver = verify_before_after(cfg, header, rows, out_header, out_rows, issues, set(prov.corrected))
     idem = idempotency_report(cfg, header, rows) if verify else []
-    idicts = [issue_dict(i) for i in issues]
+    idicts = [issue_dict(i, cfg) for i in issues]
     e = sum(1 for i in issues if i.severity == "E")
     sha = ""
     if config_path and Path(config_path).exists():
         sha = hashlib.sha256(Path(config_path).read_bytes()).hexdigest()[:12]
-    groups, cover = group_issues(issues), case_coverage(cfg, header, rows)
+    groups, cover = group_issues(issues, cfg=cfg), case_coverage(cfg, header, rows)
     if detail_files:
         rep = out.with_name(out.stem + "_conv.csv")
         write_report(st.path(rep), issues, cfg.encoding_out)

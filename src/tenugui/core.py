@@ -34,7 +34,15 @@ _FIELD_KEYS = {"src", "out", "drop_src", "required", "sub", "synonyms", "on_unkn
                "trim"}
 _DERIVE_KEYS = {"out", "expr", "vars", "unit", "to", "unit_out", "decimals", "trim", "after"}
 _PART_KEYS = (_FIELD_KEYS - {"src", "extract", "drop_src"}) | {"unit_group"}
-_TOP_KEYS = {"schema_version", "settings", "units", "unit_alias", "synonyms", "field", "derive", "test"}
+_TOP_KEYS = {"schema_version", "settings", "units", "unit_alias", "synonyms", "field", "derive", "test", "codes"}
+_CODE_KEYS = {"severity", "meaning", "hint"}
+USER_CODE_RE = re.compile(r"CU\d{3}")     # [codes] で利用者が決める報告コード（CU000〜CU999）。組み込みの C/L と重ならない
+FORMAT_WARN_CODE = "C151"                 # case の warn にメッセージを書いたときのコード
+
+
+def is_case_warn_code(code: str) -> bool:
+    """case の warn で出るコードか（C151 と利用者コード CU###）。値1つにつき1件にまとめる対象。"""
+    return code == FORMAT_WARN_CODE or bool(USER_CODE_RE.fullmatch(code))
 _TEST_KEYS = {"name", "in", "out", "codes"}
 
 
@@ -224,6 +232,7 @@ class FieldRule:
     case_rx: list[re.Pattern] = field(default_factory=list)
     case_labels: list[str] = field(default_factory=list)
     alts: dict[int, "FieldRule"] = field(default_factory=dict)
+    case_warns: list = field(default_factory=list)   # case ごとの (コード, 重大度, メッセージ) か None
 
 
 @dataclass
@@ -258,6 +267,7 @@ class Config:
     corrections: Corrections | None = None    # 訂正・保留（別ファイル）。無ければ None
     ignore_columns: list[re.Pattern] = field(
         default_factory=lambda: [re.compile(x) for x in DEFAULT_IGNORE_COLUMNS])   # 下書き・集計の対象外の列
+    user_codes: dict[str, dict] = field(default_factory=dict)   # [codes]: CU### -> {severity, meaning, hint}
 
 
 def _unknown(prefix: str, d: dict, allowed: set[str], problems: list[str]) -> None:
@@ -677,6 +687,53 @@ def config_from_dict(raw: dict, corrections: dict | None = None) -> Config:
                            "値の型（文字列・数・配列・テーブル）が違う可能性があります。tenugui schema で書き方を確認してください"]) from None
 
 
+def _parse_user_codes(raw, p: list[str]) -> dict[str, dict]:
+    """[codes]: 利用者が決める報告コード。CU001 = { severity = "W", meaning = "..." }"""
+    if not isinstance(raw, dict):
+        p.append("[codes] は CU001 = { severity = \"W\", meaning = \"説明\" } の形のテーブルで書きます")
+        return {}
+    res = {}
+    for code, d in raw.items():
+        w = f"[codes] {code}"
+        if not USER_CODE_RE.fullmatch(str(code)):
+            p.append(f"{w}: 利用者のコードは CU000〜CU999（CU + 数字3桁）で書きます。C / L で始まるコードは組み込み用です")
+            continue
+        if not isinstance(d, dict):
+            p.append(f"{w}: {{ severity = \"W\", meaning = \"説明\" }} の形で書きます")
+            continue
+        _unknown(w, d, _CODE_KEYS, p)
+        sev = d.get("severity", "W")
+        if sev not in ("W", "E"):
+            p.append(f"{w}: severity は \"W\"（警告）か \"E\"（エラー）")
+        meaning = d.get("meaning")
+        if not isinstance(meaning, str) or not meaning.strip():
+            p.append(f"{w}: meaning（このコードの意味）が必要です")
+            continue
+        hint = d.get("hint", "")
+        if not isinstance(hint, str):
+            p.append(f"{w}: hint は文字列で書きます")
+            hint = ""
+        res[str(code)] = {"severity": sev if sev in ("W", "E") else "W", "meaning": meaning.strip(), "hint": hint}
+    return res
+
+
+def _case_warn(v, user_codes: dict, cw: str, p: list[str]) -> tuple | None:
+    """case の warn。メッセージなら C151(W)、CU### ならそのコード（[codes] の定義が必要）。"""
+    if v is None:
+        return None
+    if not isinstance(v, str) or not v.strip():
+        p.append(f"{cw}: warn は \"理由のメッセージ\" か \"CU001\" のような [codes] のコードで書きます（空は不可）")
+        return None
+    v = v.strip()
+    if USER_CODE_RE.fullmatch(v):
+        d = user_codes.get(v)
+        if d is None:
+            p.append(f"{cw}: warn = {v!r} が [codes] にありません{did_you_mean(v, set(user_codes))}")
+            return None
+        return (v, d["severity"], d["meaning"])
+    return (FORMAT_WARN_CODE, "W", v)
+
+
 def _config_from_dict(raw: dict, corrections: dict | None = None) -> Config:
     p: list[str] = []
     _unknown("トップレベル", raw, _TOP_KEYS, p)
@@ -684,6 +741,7 @@ def _config_from_dict(raw: dict, corrections: dict | None = None) -> Config:
         p.append(f"schema_version = {SCHEMA_VERSION} が必要です")
     st = raw.get("settings", {})
     _unknown("[settings]", st, _SETTINGS_KEYS, p)
+    user_codes = _parse_user_codes(raw.get("codes", {}), p)
     on_error = st.get("on_error", "keep")
     if on_error not in ("keep", "empty"):
         p.append("[settings] on_error は keep / empty")
@@ -757,13 +815,14 @@ def _config_from_dict(raw: dict, corrections: dict | None = None) -> Config:
             if not isinstance(f["case"], list) or not f["case"]:
                 p.append(f"{w}: case は [[field.case]] を1つ以上書きます")
                 continue
-            rxs, labels, by_out = [], [], {}
+            rxs, labels, by_out, warns = [], [], {}, []
             for k, cs in enumerate(f["case"]):
                 cw = f"{w}.case#{k + 1}"
-                _unknown(cw, cs, {"preset", "match", "pattern", "parts"}, p)
+                _unknown(cw, cs, {"preset", "match", "pattern", "parts", "warn"}, p)
                 got = _matcher_parts(cs, f["src"], False, cw, units, synonyms, p)
                 if got is None:
                     continue
+                warns.append(_case_warn(cs.get("warn"), user_codes, cw, p))
                 rx, label, parts = got
                 seen_out = set()
                 for fr in parts:
@@ -777,7 +836,7 @@ def _config_from_dict(raw: dict, corrections: dict | None = None) -> Config:
                 labels.append(label)
             for out, alts in by_out.items():
                 fields.append(FieldRule(src=f["src"], out=out, drop_src=bool(f.get("drop_src", False)),
-                                        case_rx=rxs, case_labels=labels, alts=alts))
+                                        case_rx=rxs, case_labels=labels, alts=alts, case_warns=warns))
             continue
         if "preset" in f or "match" in f or "pattern" in f or "parts" in f:
             _unknown(w, f, {"src", "preset", "match", "pattern", "parts", "drop_src"}, p)
@@ -879,7 +938,7 @@ def _config_from_dict(raw: dict, corrections: dict | None = None) -> Config:
         p.extend(cp)
     if p:
         raise ConfigError(p)
-    return Config(ignore_columns=ignore_columns, corrections=cor, synonym_tables=synonym_tables, null_keys=frozenset(null_key(x) for x in nulls), rare_shape=float(rare), tests=tests, units=units, fields=fields, derives=derives, synonyms=synonyms,
+    return Config(user_codes=user_codes, ignore_columns=ignore_columns, corrections=cor, synonym_tables=synonym_tables, null_keys=frozenset(null_key(x) for x in nulls), rare_shape=float(rare), tests=tests, units=units, fields=fields, derives=derives, synonyms=synonyms,
                   encoding_in=st.get("encoding_in", "utf-8-sig"),
                   encoding_out=st.get("encoding_out", "utf-8-sig"),
                   passthrough=bool(st.get("passthrough", True)),
@@ -1002,6 +1061,10 @@ def _apply_field(cfg: Config, fr: FieldRule, raw: str, nums: dict, rowctx: tuple
             issue("C111", "E", f"どの case にも一致しません（形: {_clip(shape_of(raw))}）")
             return "" if (cfg.on_error == "empty" or fr.out != fr.src) else raw
         tr("case", f"#{k + 1} {fr.case_labels[k]}")
+        wn = fr.case_warns[k] if k < len(fr.case_warns) else None
+        if wn:      # 書き方は本来と違うが、意味は確定するので値は取る。報告だけ残す（値1つにつき1件）
+            issue(wn[0], wn[1], f"case #{k + 1}: {wn[2]}")
+            tr("warn", f"{wn[0]} {wn[2]}")
         alt = fr.alts.get(k)
         if alt is None:
             return ""       # この書式には、この出力列にあたる部分がない
@@ -1206,7 +1269,7 @@ def dedupe_issues(issues: list[Issue]) -> list[Issue]:
     seen: set = set()
     out: list[Issue] = []
     for i in issues:
-        k = (i.row, i.column, i.code, i.message) if i.code == "C111" else \
+        k = (i.row, i.column, i.code, i.message) if (i.code == "C111" or is_case_warn_code(i.code)) else \
             (i.row, i.column, i.out, i.code, i.message)
         if k not in seen:
             seen.add(k)
