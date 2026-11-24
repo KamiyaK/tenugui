@@ -10,7 +10,7 @@ import re
 import unicodedata
 from pathlib import Path
 
-from .core import Config, Issue, _is_reserved, uniquify
+from .core import Config, Issue, _is_reserved, is_case_warn_code, uniquify
 from .corrections import KIND_LABEL, Provenance
 
 MAX_HTML_ROWS = 2000      # これを超える入力は、問題のある行だけを表に載せる
@@ -19,10 +19,10 @@ DISPLAY_CHARS = 80        # 表のセルに出す文字数。長い値は省略�
 _CSS = """
 :root{--bg:#fff;--fg:#1c1c1c;--mut:#666;--line:#d8d8d8;--head:#f3f3f1;
 --err:#fbd5d5;--errb:#c0392b;--warn:#fdf0b8;--warnb:#a67c00;--chg:#dcefdc;--ng:#e4e4e4;--src:#fafaf7;
---cor:#d6e6fb;--corb:#1f5fae;--hold:#ead9f7;--holdb:#6b3fa0}
+--cor:#d6e6fb;--corb:#1f5fae;--hold:#ead9f7;--holdb:#6b3fa0;--fmt:#fde2c8;--fmtb:#b4570b}
 @media (prefers-color-scheme:dark){:root{--bg:#1b1b1b;--fg:#e8e8e8;--mut:#a0a0a0;--line:#444;--head:#2a2a2a;
 --err:#5a2323;--errb:#ff8a80;--warn:#57480f;--warnb:#ffd54f;--chg:#1f3d24;--ng:#3a3a3a;--src:#222;
---cor:#1d3557;--corb:#8ab4f8;--hold:#40295c;--holdb:#c9a4f5}}
+--cor:#1d3557;--corb:#8ab4f8;--hold:#40295c;--holdb:#c9a4f5;--fmt:#5a3414;--fmtb:#ffb074}}
 *{box-sizing:border-box}
 body{margin:0;padding:20px 24px 60px;background:var(--bg);color:var(--fg);
 font:14px/1.5 system-ui,-apple-system,"Segoe UI","Hiragino Sans","Yu Gothic UI",Meiryo,sans-serif}
@@ -36,7 +36,7 @@ h1{font-size:20px;margin:0 0 4px}h2{font-size:15px;margin:28px 0 8px;border-bott
 .card.warn{border-color:var(--warnb)}.card.warn b{color:var(--warnb)}
 .card.cor{border-color:var(--corb)}.card.cor b{color:var(--corb)}
 .card.hold{border-color:var(--holdb)}.card.hold b{color:var(--holdb)}
-td.cor{background:var(--cor)}td.hold{background:var(--hold)}
+td.cor{background:var(--cor)}td.hold{background:var(--hold)}td.fmt{background:var(--fmt)}td.fmt .tag{color:var(--fmtb)}
 td.cor .tag{color:var(--corb)}td.hold .tag{color:var(--holdb)}
 td.wrapc{white-space:normal;min-width:220px;max-width:420px}
 details{margin:8px 0}summary{cursor:pointer;font-weight:600}
@@ -295,7 +295,7 @@ def render_html(rep: dict, cfg: Config, header: list[str], rows: list[list[str]]
     for i in issues:
         if i.column in outs_of:
             mark(i.row, ("src", i.column), i.severity, i.code, i.message)
-            targets = outs_of[i.column] if (i.code in ("C111", "C131") or not i.out) else [i.out]
+            targets = outs_of[i.column] if (i.code in ("C111", "C131") or is_case_warn_code(i.code) or not i.out) else [i.out]
             for t in targets:
                 mark(i.row, t, i.severity, i.code, i.message)
         else:
@@ -323,7 +323,8 @@ def render_html(rep: dict, cfg: Config, header: list[str], rows: list[list[str]]
         P.append("<h2>問題の内訳（列 × コード × 形）</h2><div class='wrap'><table><thead><tr><th>件数</th><th>コード</th>"
                  "<th>列</th><th>形</th><th>例</th><th>行</th><th>直し方</th></tr></thead><tbody>")
         for g in rep["issue_groups"]:
-            cls = "err" if g["severity"] == "E" else ("hold" if g["code"] == "C141" else "warn")
+            cls = "err" if g["severity"] == "E" else ("hold" if g["code"] == "C141" else
+                                                      ("fmt" if is_case_warn_code(g["code"]) else "warn"))
             col = g["column"] + (f" → {g['out']}" if g["out"] and g["out"] != g["column"] else "")
             P.append(f"<tr><td class='num'>{g['count']}</td><td class='{cls}'>{_e(g['code'])}</td><td>{_e(col)}</td>"
                      f"<td><code>{_e(g['shape'])}</code></td><td>{_e(' / '.join(g['examples']))}</td>"
@@ -363,6 +364,7 @@ def render_html(rep: dict, cfg: Config, header: list[str], rows: list[list[str]]
     P.append("<h2>変換前後（ルールのかかった列）</h2>")
     P.append("<p class='legend'><span style='background:var(--err)'>エラー（変換できず）</span>"
              "<span style='background:var(--warn)'>警告（要確認）</span>"
+             "<span style='background:var(--fmt)'>書き方が本来と違う（値は取り出した）</span>"
              f"<span style='background:var(--chg)'>値を変換した{'（表記統一・単位）' if pv['corrections_file'] else ''}</span>"
              + ("<span style='background:var(--cor)'>訂正（誤記を直して変換）</span>"
                 "<span style='background:var(--hold)'>保留（変換していない）</span>" if pv["corrections_file"] else "") +
@@ -385,7 +387,8 @@ def render_html(rep: dict, cfg: Config, header: list[str], rows: list[list[str]]
         def cell(n: int, col, text: str, base: str):
             m = marks.get((n, col))
             if m:
-                cls = "err" if m[0] == "E" else ("hold" if m[2] == ["C141"] else "warn")
+                cls = "err" if m[0] == "E" else ("hold" if m[2] == ["C141"] else
+                                                 ("fmt" if all(is_case_warn_code(c) for c in m[2]) else "warn"))
                 tags = tuple("保留" if x == "C141" else x for x in m[2])
                 return [text, cls, titles.setdefault(" / ".join(m[1]), len(titles)), tagsets.setdefault(tags, len(tagsets))]
             return [text, base] if base else text

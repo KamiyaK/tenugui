@@ -111,6 +111,7 @@ CODES = {
     "C103": ("E", "未定義の単位、または次元が違って換算できない"), "C104": ("E", "strip_units に無い単位"),
     "C111": ("E", "preset / pattern / match / extract / case に一致しない"),
     "C121": ("W/E", "同義語表に無い値"), "C131": ("W", "変換はできたが、列の中で少数派の形"),
+    "C151": ("W", "case の warn: 書き方が本来と違うが、値は取り出した"),
     "C141": ("W", "保留（訂正ファイルの [[hold]]）。変換せず元の値のまま通した"),
     "C201": ("E", "必須項目が空"),
     "C301": ("E", "派生: 入力が数値として読めない"), "C302": ("W", "派生: 入力が抽出NG印"),
@@ -120,6 +121,7 @@ CODES = {
     "L201": ("W", "使われていない同義語表"),
     "L501": ("W", "ignore_columns に当たる列に field がある"),
     "L401": ("W", "正規表現に繰り返しの入れ子があり、値によっては極端に遅くなる"),
+    "L601": ("W", "warn 付きの case がほぼ何でも受ける（エラーで止まるべき値まで警告に下がる）"),
     "L301": ("W", "当たらなかった訂正（元データが直った、または列名・値の書き間違い）"),
     "L302": ("W", "当たらなかった保留"), "L303": ("W", "訂正・保留の列が入力に無い（check）"),
 }
@@ -149,12 +151,21 @@ def schema() -> dict:
                              "keys": {**{k: FIELD_ONLY[k] for k in ("src", "for", "drop_src")},
                                       "each": SPLIT_KEYS["each"],
                                       "case": K("table[]", "[[field.case]]。各要素は split と同じ"
-                                                           "（preset / pattern / match のどれか1つ + parts、each）", required=True)}},
+                                                           "（preset / pattern / match のどれか1つ + parts、each）に加えて warn", required=True)},
+                             "case_keys": {"warn": K("string", "この case に一致したら、値は取り出したうえで報告する。"
+                                                               "\"メッセージ\" なら C151(W)、\"CU001\" なら [codes] の定義で報告。"
+                                                               "意味が1通りに決まる書き方違いだけに付ける（2通りに読めるなら [[hold]]）")}},
                 },
                 "value_keys": VALUE_KEYS, "part_only_keys": PART_ONLY,
                 "order": "抽出NG印はそのまま → null_values と空 → 全角半角の統一 → sub → synonyms → "
                          "preset/pattern/match/extract → number_only または to（換算） → decimals/trim/unit_out",
             },
+            "codes": {"table": "[codes]", "desc": "利用者が決める報告コード。キーは CU000〜CU999（CU + 数字3桁）。"
+                                                  "case の warn から参照する。組み込みのコード（C / L）は変えられない",
+                      "example": 'CU001 = { severity = "W", meaning = "単位なし（記載ルール違反）", hint = "元データの修正を依頼" }',
+                      "keys": {"severity": K("W|E", "重大度", default="W"),
+                               "meaning": K("string", "意味。報告のメッセージになる", required=True),
+                               "hint": K("string", "対処のヒント（レポートの hint）", default="")}},
             "derive": {"table": "[[derive]]", "desc": "他の列から計算する列。宣言順に評価する", "keys": DERIVE},
             "test": {"table": "[[test]]", "desc": "入力 → 期待値。check と test が実行する", "keys": TEST},
         },
